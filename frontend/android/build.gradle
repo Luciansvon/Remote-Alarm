@@ -22,6 +22,11 @@ allprojects {
         google()
         mavenCentral()
     }
+    // AUD-08: Kunci Java 17 secara permanen pada semua modul subproject & task kompilasi
+    tasks.withType(JavaCompile).configureEach {
+        sourceCompatibility = JavaVersion.VERSION_17.toString()
+        targetCompatibility = JavaVersion.VERSION_17.toString()
+    }
 }
 
 subprojects {

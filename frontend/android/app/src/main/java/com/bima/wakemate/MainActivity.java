@@ -10,6 +10,8 @@ import com.getcapacitor.BridgeActivity;
 public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
+        // Daftarkan plugin native kustom WakeMate sebelum inisialisasi Bridge
+        registerPlugin(WakeMateNativePlugin.class);
         super.onCreate(savedInstanceState);
 
         // Nyalakan layar dan tampilkan di atas layar kunci saat alarm aktif

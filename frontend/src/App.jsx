@@ -18,23 +18,32 @@ import {
   User,
   ShieldCheck,
   ListTodo,
-  Music,
   Upload,
   Pause
 } from 'lucide-react';
+import { registerPlugin } from '@capacitor/core';
 import { soundManager } from './soundManager';
 import './App.css';
 
+// Jembatan Native Android WakeMate (AUD-06)
+const WakeMateNative = registerPlugin('WakeMateNative');
+
+// AUD-05: Konfigurasi URL server fleksibel dengan dukungan environment variable
 const defaultServer = localStorage.getItem('wakemate_server') || (
-  window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-    ? 'http://192.168.0.23:4000'
-    : `http://${window.location.hostname}:4000`
+  import.meta.env?.VITE_DEFAULT_SERVER_URL || (
+    window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+      ? 'http://192.168.0.23:4000'
+      : `http://${window.location.hostname}:4000`
+  )
 );
 
 export default function App() {
-  // Pengaturan Kamar & Peran
+  // Pengaturan Kamar & Peran (AUD-01)
   const [roomId, setRoomId] = useState('CINTA-BIMA');
   const [tempRoomId, setTempRoomId] = useState('CINTA-BIMA');
+  const [roomPin, setRoomPin] = useState(localStorage.getItem('wakemate_pin') || '1234');
+  const [tempRoomPin, setTempRoomPin] = useState(localStorage.getItem('wakemate_pin') || '1234');
+  const [authError, setAuthError] = useState(null);
   const [currentRole, setCurrentRole] = useState('bima'); // 'bima', 'pacar', 'simulasi'
 
   // Pengaturan Server
@@ -96,8 +105,31 @@ export default function App() {
 
     socket.on('connect', () => {
       setIsConnected(true);
+      setAuthError(null);
       const username = currentRole === 'bima' ? 'Bima' : 'Pacar';
-      socket.emit('join_room', { roomId, username });
+      // AUD-01: Kirim roomId dan PIN terotentikasi
+      socket.emit('join_room', { roomId, username, pin: roomPin });
+
+      // AUD-06: Jalankan Foreground Service siaga saat terhubung
+      try {
+        WakeMateNative.startForegroundService().catch(() => {});
+      } catch (_) {}
+    });
+
+    socket.on('auth_error', (data) => {
+      setAuthError(data?.message || 'PIN kamar tidak cocok!');
+      setWakeUpNotice(`⚠️ ${data?.message || 'PIN kamar tidak cocok!'}`);
+      setTimeout(() => setWakeUpNotice(null), 6000);
+    });
+
+    socket.on('alarm_error', (data) => {
+      setWakeUpNotice('⚠️ ' + (data?.message || 'Gagal mengatur alarm'));
+      setTimeout(() => setWakeUpNotice(null), 5000);
+    });
+
+    socket.on('rate_limit_error', (data) => {
+      setWakeUpNotice('⏳ ' + (data?.message || 'Tunggu sebentar sebelum mencoba lagi'));
+      setTimeout(() => setWakeUpNotice(null), 4000);
     });
 
     socket.on('disconnect', () => {
@@ -106,6 +138,7 @@ export default function App() {
 
     socket.on('room_state', (data) => {
       if (data.roomId === roomId) {
+        setAuthError(null);
         setScheduledAlarms(data.scheduledAlarms || []);
         if (data.isAlarmActive && data.currentAlarm) {
           triggerLocalAlarm(data.currentAlarm);
@@ -118,9 +151,11 @@ export default function App() {
     });
 
     socket.on('alarm_triggered', (data) => {
-      // Periksa apakah perangkat ini adalah pengirim alarm
+      // AUD-07: Periksa apakah perangkat fisik ini adalah pengirim alarm murni
       const myName = currentRole === 'bima' ? 'Bima' : 'Pacar';
-      const isSender = data?.sender === myName && currentRole !== 'simulasi';
+      const isSender = currentRole !== 'simulasi' && (
+        data?.senderSocketId ? data.senderSocketId === socket.id : (data?.target && data.target !== myName)
+      );
 
       if (isSender) {
         // Jika saya yang mengirim alarm, jangan bunyikan HP saya dan jangan kunci layar saya!
@@ -140,8 +175,11 @@ export default function App() {
     return () => {
       socket.disconnect();
       stopPreviewAudio();
+      try {
+        WakeMateNative.stopForegroundService().catch(() => {});
+      } catch (_) {}
     };
-  }, [serverUrl, roomId, currentRole]);
+  }, [serverUrl, roomId, roomPin, currentRole]);
 
   // Kontrol Preview Suara Manual
   const stopPreviewAudio = () => {
@@ -193,6 +231,11 @@ export default function App() {
     setAlarmData(data);
     setMissionCount(0);
     setWakeUpNotice(null);
+
+    // AUD-06: Paksa volume perangkat fisik ke tingkat maksimal 100% pada detik alarm berdering
+    try {
+      WakeMateNative.maximizeVolume().catch(() => {});
+    } catch (_) {}
 
     const volume = data.volume || 100;
     const soundType = data.sound || 'siren';
@@ -349,9 +392,15 @@ export default function App() {
   const handleChangeRoom = (e) => {
     e.preventDefault();
     if (!tempRoomId.trim()) return;
-    setRoomId(tempRoomId.toUpperCase().trim());
-    setWakeUpNotice(`🔑 Berhasil pindah ke kamar ${tempRoomId.toUpperCase().trim()}`);
-    setTimeout(() => setWakeUpNotice(null), 3000);
+    const cleanRoom = tempRoomId.toUpperCase().trim();
+    const cleanPin = tempRoomPin.trim() || '1234';
+
+    localStorage.setItem('wakemate_pin', cleanPin);
+    setRoomId(cleanRoom);
+    setRoomPin(cleanPin);
+    setAuthError(null);
+    setWakeUpNotice(`🔑 Menyambungkan ke kamar ${cleanRoom} (PIN: ${cleanPin})...`);
+    setTimeout(() => setWakeUpNotice(null), 4000);
   };
 
   // Preset pesan cepat
@@ -912,22 +961,47 @@ export default function App() {
             </button>
           </div>
 
-          {/* Ganti Kode Kamar Pasangan */}
+          {/* Ganti Kode & PIN Kamar Pasangan (AUD-01) */}
           <div className="nb-card">
             <h3 style={{ fontSize: '1.05rem', fontWeight: 900, marginBottom: '6px' }}>
-              🔑 Kode Kamar Pasangan:
+              🔑 Kode & PIN Kamar Pasangan:
             </h3>
             <p style={{ fontSize: '0.8rem', color: '#666', marginBottom: '12px' }}>
-              Pastikan HP Bima dan HP Pacar memasukkan kode rahasia yang sama persis agar sinyal alarm terhubung.
+              Pastikan Nama Kamar dan PIN rahasia sama persis di HP Bima dan HP Pacar agar aman dari gangguan luar.
             </p>
+
+            {authError && (
+              <div className="nb-badge" style={{ backgroundColor: '#FF5757', color: '#FFF', width: '100%', marginBottom: '12px', textAlign: 'center', padding: '10px' }}>
+                ⚠️ {authError}
+              </div>
+            )}
+
             <form onSubmit={handleChangeRoom}>
+              <label style={{ fontSize: '0.8rem', fontWeight: 800, color: '#333', display: 'block', marginBottom: '4px' }}>
+                Nama Kamar:
+              </label>
               <input 
                 type="text" 
                 value={tempRoomId}
                 onChange={(e) => setTempRoomId(e.target.value)}
                 className="nb-input"
+                placeholder="MISAL: CINTA-BIMA"
                 style={{ textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '10px' }}
               />
+
+              <label style={{ fontSize: '0.8rem', fontWeight: 800, color: '#333', display: 'block', marginBottom: '4px' }}>
+                PIN Rahasia Kamar:
+              </label>
+              <input 
+                type="password" 
+                value={tempRoomPin}
+                onChange={(e) => setTempRoomPin(e.target.value)}
+                className="nb-input"
+                placeholder="1234"
+                maxLength={10}
+                style={{ letterSpacing: '2px', marginBottom: '12px' }}
+              />
+
               <button 
                 type="submit"
                 className="nb-button nb-button-success"

@@ -1,4 +1,13 @@
 // Web Audio API Sound Synthesizer & Voice Recorder Player
+
+const AUDIO_DATA_URL_REGEX = /^data:audio\/(webm|ogg|mp3|mpeg|wav|mp4|aac|x-m4a);base64,[A-Za-z0-9+/=]+$/i;
+
+export function sanitizeVoiceDataUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  const trimmed = rawUrl.trim();
+  return AUDIO_DATA_URL_REGEX.test(trimmed) ? trimmed : null;
+}
+
 class AlarmSoundManager {
   constructor() {
     this.audioCtx = null;
@@ -25,14 +34,19 @@ class AlarmSoundManager {
 
     // Jika menggunakan rekaman suara kustom Bima atau file audio TikTok / MP3
     if ((soundType === 'voice' || soundType === 'tiktok' || soundType === 'custom_audio') && voiceDataUrl) {
-      try {
-        this.customAudioEl = new Audio(voiceDataUrl);
-        this.customAudioEl.loop = true;
-        this.customAudioEl.volume = Math.min(Math.max(volumePercent / 100, 0.1), 1.0);
-        this.customAudioEl.play().catch(e => console.error("Gagal putar suara custom:", e));
-        return;
-      } catch (err) {
-        console.error("Audio tag error:", err);
+      const safeAudioUrl = sanitizeVoiceDataUrl(voiceDataUrl);
+      if (safeAudioUrl) {
+        try {
+          this.customAudioEl = new Audio(safeAudioUrl);
+          this.customAudioEl.loop = true;
+          this.customAudioEl.volume = Math.min(Math.max(volumePercent / 100, 0.1), 1.0);
+          this.customAudioEl.play().catch(e => console.error("Gagal putar suara custom:", e));
+          return;
+        } catch (err) {
+          console.error("Audio tag error:", err);
+        }
+      } else {
+        console.warn("AUD-04: Audio Data URI tidak valid atau berisiko, mengalihkan pemutaran ke sirine bawaan.");
       }
     }
 
@@ -91,10 +105,8 @@ class AlarmSoundManager {
       osc.stop(this.audioCtx.currentTime + 0.09);
     };
 
-    let counter = 0;
     this.intervalId = setInterval(() => {
       beep();
-      counter++;
     }, 130);
   }
 

@@ -41,6 +41,10 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Lint Code with Oxlint (AUD-08)
+        working-directory: frontend
+        run: npx oxlint
+
       - name: Build Web Application
         working-directory: frontend
         run: npm run build
