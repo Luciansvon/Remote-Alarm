@@ -118,6 +118,18 @@ export default function App() {
     });
 
     socket.on('alarm_triggered', (data) => {
+      // Periksa apakah perangkat ini adalah pengirim alarm
+      const myName = currentRole === 'bima' ? 'Bima' : 'Pacar';
+      const isSender = data?.sender === myName && currentRole !== 'simulasi';
+
+      if (isSender) {
+        // Jika saya yang mengirim alarm, jangan bunyikan HP saya dan jangan kunci layar saya!
+        setWakeUpNotice(`📢 Sinyal alarm berhasil terkirim dan sedang berdering di HP ${data?.target || 'Pasangan'}!`);
+        setTimeout(() => setWakeUpNotice(null), 6000);
+        return;
+      }
+
+      // Jika saya adalah target penerima, bunyikan alarm darurat di HP saya
       triggerLocalAlarm(data);
     });
 
@@ -318,8 +330,6 @@ export default function App() {
   };
 
   const handleStopAlarm = () => {
-    if (!socketRef.current) return;
-    
     // Jika misi aktif, wajib tekan 3 kali
     if (alarmData?.missionRequired && missionCount < 2) {
       setMissionCount(prev => prev + 1);
@@ -327,7 +337,13 @@ export default function App() {
     }
 
     const stopper = currentRole === 'bima' ? 'Bima' : 'Pacar';
-    socketRef.current.emit('stop_alarm', { roomId, stopper });
+
+    // Matikan suara lokal terlebih dahulu (optimistic local stop) agar aman jika koneksi offline
+    stopLocalAlarm(stopper);
+
+    if (socketRef.current) {
+      socketRef.current.emit('stop_alarm', { roomId, stopper });
+    }
   };
 
   const handleChangeRoom = (e) => {
@@ -751,6 +767,40 @@ export default function App() {
               ) : (
                 <span className="nb-badge" style={{ backgroundColor: '#FFE600' }}>Pilih</span>
               )}
+            </div>
+          </div>
+
+          {/* Kartu Volume & Misi Bangun untuk Jadwal */}
+          <div className="nb-card">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+              <label style={{ fontWeight: 800, fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Volume2 size={16} /> Volume Jam Bangun:
+              </label>
+              <span className="nb-badge" style={{ backgroundColor: selectedVolume >= 90 ? '#FF5757' : '#FFE600', color: selectedVolume >= 90 ? '#FFF' : '#000' }}>
+                {selectedVolume}% {selectedVolume === 100 ? '⚡ FULL' : ''}
+              </span>
+            </div>
+            <input 
+              type="range" 
+              min="50" 
+              max="100" 
+              step="5" 
+              value={selectedVolume}
+              onChange={(e) => setSelectedVolume(Number(e.target.value))}
+              style={{ width: '100%', accentColor: '#000000', cursor: 'pointer', height: '8px', marginBottom: '14px' }}
+            />
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', paddingTop: '8px', borderTop: '2px dashed #EEE' }}>
+              <input 
+                type="checkbox" 
+                id="missionCheckSchedule" 
+                checked={missionRequired}
+                onChange={(e) => setMissionRequired(e.target.checked)}
+                style={{ width: '20px', height: '20px', accentColor: '#000', cursor: 'pointer' }}
+              />
+              <label htmlFor="missionCheckSchedule" style={{ fontWeight: 800, fontSize: '0.85rem', cursor: 'pointer' }}>
+                🎯 Wajib ketuk tombol 3x agar alarm mati
+              </label>
             </div>
           </div>
 

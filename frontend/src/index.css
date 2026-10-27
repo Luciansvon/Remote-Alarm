@@ -238,15 +238,15 @@ body {
   box-shadow: 3px 3px 0px #000000;
 }
 
-/* Alarm Ringing Animation */
+/* Alarm Ringing Animation (Dihaluskan agar tidak menyilaukan mata di kamar gelap) */
 @keyframes alarmFlashBg {
   0% { background-color: #FF3B30; }
-  50% { background-color: #FFE600; }
+  50% { background-color: #FFA500; }
   100% { background-color: #FF3B30; }
 }
 
 .alarm-ringing-bg {
-  animation: alarmFlashBg 0.5s infinite ease-in-out;
+  animation: alarmFlashBg 1.6s infinite ease-in-out;
   position: fixed;
   inset: 0;
   z-index: 100;

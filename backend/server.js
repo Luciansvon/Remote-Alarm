@@ -24,21 +24,28 @@ setInterval(() => {
   const now = Date.now();
   for (const roomId in rooms) {
     const room = rooms[roomId];
-    if (!room.scheduledAlarms) continue;
+    if (!room || !room.scheduledAlarms) continue;
 
+    let scheduleUpdated = false;
     for (let i = room.scheduledAlarms.length - 1; i >= 0; i--) {
       const alarm = room.scheduledAlarms[i];
       if (alarm.triggerTime <= now && !alarm.fired) {
         alarm.fired = true;
         room.isAlarmActive = true;
-        room.currentAlarm = alarm;
+        room.currentAlarm = { ...alarm };
 
-        console.log(`[JADWAL TIBA] Alarm '${alarm.title}' di Room ${roomId} berdering sekarang!`);
-        io.to(roomId).emit('alarm_triggered', alarm);
+        const alarmTitle = alarm.message || alarm.sound || 'Alarm Terjadwal';
+        console.log(`[JADWAL TIBA] Alarm '${alarmTitle}' di Room ${roomId} berdering sekarang!`);
+        io.to(roomId).emit('alarm_triggered', room.currentAlarm);
         
-        // Perbarui daftar jadwal di klien
-        io.to(roomId).emit('scheduled_list_updated', room.scheduledAlarms);
+        // Hapus Base64 dari riwayat setelah berdering agar memori RAM tidak bengkak
+        alarm.voiceDataUrl = null;
+        scheduleUpdated = true;
       }
+    }
+
+    if (scheduleUpdated) {
+      io.to(roomId).emit('scheduled_list_updated', room.scheduledAlarms);
     }
   }
 }, 1000);
@@ -55,9 +62,12 @@ io.on('connection', (socket) => {
   console.log(`[Koneksi Baru] ID Klien: ${socket.id}`);
 
   // Bergabung ke ruangan pasangan
-  socket.on('join_room', ({ roomId, username }) => {
+  socket.on('join_room', (data = {}) => {
+    const { roomId, username } = data;
+    if (!roomId) return;
+
     socket.join(roomId);
-    socket.data = { roomId, username };
+    socket.data = { roomId, username: username || 'Pasangan' };
 
     if (!rooms[roomId]) {
       rooms[roomId] = {
@@ -68,9 +78,12 @@ io.on('connection', (socket) => {
       };
     }
 
-    rooms[roomId].users[socket.id] = { username, joinedAt: Date.now() };
+    rooms[roomId].users[socket.id] = { 
+      username: username || 'Pasangan', 
+      joinedAt: Date.now() 
+    };
 
-    console.log(`[Room ${roomId}] ${username} bergabung.`);
+    console.log(`[Room ${roomId}] ${username || 'Pasangan'} bergabung.`);
     
     io.to(roomId).emit('room_state', {
       roomId,
@@ -82,46 +95,47 @@ io.on('connection', (socket) => {
   });
 
   // Memicu alarm instan jarak jauh
-  socket.on('trigger_alarm', (data) => {
-    const roomId = data.roomId || socket.data.roomId;
-    if (!roomId) return;
+  socket.on('trigger_alarm', (data = {}) => {
+    const roomId = data.roomId || socket.data?.roomId;
+    if (!roomId || !rooms[roomId]) return;
 
     const alarmPayload = {
       id: 'instan_' + Date.now(),
-      sender: data.sender || socket.data.username || 'Pasangan',
-      volume: data.volume || 100,
+      sender: data.sender || socket.data?.username || 'Bima',
+      target: data.target || data.targetName || 'Pacar',
+      volume: typeof data.volume === 'number' ? data.volume : 100,
       sound: data.sound || 'siren',
-      message: data.message || 'Waktunya bangun!',
+      message: String(data.message || 'Waktunya bangun!').slice(0, 200),
       voiceDataUrl: data.voiceDataUrl || null,
-      missionRequired: data.missionRequired || false,
+      missionRequired: Boolean(data.missionRequired),
       timestamp: Date.now()
     };
 
-    if (rooms[roomId]) {
-      rooms[roomId].isAlarmActive = true;
-      rooms[roomId].currentAlarm = alarmPayload;
-    }
+    rooms[roomId].isAlarmActive = true;
+    rooms[roomId].currentAlarm = alarmPayload;
 
-    console.log(`[ALARM INSTAN] Room ${roomId} oleh ${alarmPayload.sender} vol: ${alarmPayload.volume}%`);
+    console.log(`[ALARM INSTAN] Room ${roomId} dari ${alarmPayload.sender} ke ${alarmPayload.target} vol: ${alarmPayload.volume}%`);
     io.to(roomId).emit('alarm_triggered', alarmPayload);
   });
 
   // Menjadwalkan alarm jarak jauh (Custom Jam & Pesan)
-  socket.on('schedule_alarm', (data) => {
-    const roomId = data.roomId || socket.data.roomId;
+  socket.on('schedule_alarm', (data = {}) => {
+    const roomId = data.roomId || socket.data?.roomId;
     if (!roomId || !rooms[roomId]) return;
 
     const newAlarm = {
       id: 'sch_' + Date.now(),
-      creator: data.creator || socket.data.username || 'Bima',
-      targetName: data.targetName || 'Pacar',
-      timeString: data.timeString, // Format "HH:mm" misal "06:30"
-      triggerTime: data.triggerTime, // Epoch millisecond
-      volume: data.volume || 100,
+      creator: data.creator || socket.data?.username || 'Bima',
+      sender: data.creator || socket.data?.username || 'Bima',
+      target: data.target || data.targetName || 'Pacar',
+      targetName: data.target || data.targetName || 'Pacar',
+      timeString: data.timeString || '06:30', // Format "HH:mm" misal "06:30"
+      triggerTime: Number(data.triggerTime) || Date.now(), // Epoch millisecond
+      volume: typeof data.volume === 'number' ? data.volume : 100,
       sound: data.sound || 'siren',
-      message: data.message || 'Waktunya bangun!',
+      message: String(data.message || 'Waktunya bangun!').slice(0, 200),
       voiceDataUrl: data.voiceDataUrl || null,
-      missionRequired: data.missionRequired || false,
+      missionRequired: Boolean(data.missionRequired),
       fired: false,
       createdAt: Date.now()
     };
@@ -133,17 +147,18 @@ io.on('connection', (socket) => {
   });
 
   // Menghapus alarm yang dijadwalkan
-  socket.on('delete_scheduled_alarm', ({ alarmId }) => {
-    const roomId = socket.data.roomId;
-    if (roomId && rooms[roomId]) {
+  socket.on('delete_scheduled_alarm', (data = {}) => {
+    const alarmId = data.alarmId;
+    const roomId = socket.data?.roomId;
+    if (roomId && rooms[roomId] && alarmId) {
       rooms[roomId].scheduledAlarms = rooms[roomId].scheduledAlarms.filter(a => a.id !== alarmId);
       io.to(roomId).emit('scheduled_list_updated', rooms[roomId].scheduledAlarms);
     }
   });
 
   // Mematikan alarm (tombol "Sudah Bangun")
-  socket.on('stop_alarm', (data) => {
-    const roomId = data.roomId || socket.data.roomId;
+  socket.on('stop_alarm', (data = {}) => {
+    const roomId = data.roomId || socket.data?.roomId;
     if (!roomId) return;
 
     if (rooms[roomId]) {
@@ -151,7 +166,7 @@ io.on('connection', (socket) => {
       rooms[roomId].currentAlarm = null;
     }
 
-    const stopperName = data.stopper || socket.data.username || 'Pacar';
+    const stopperName = data.stopper || socket.data?.username || 'Pacar';
     console.log(`[ALARM DIMATIKAN] Room ${roomId} oleh ${stopperName}`);
 
     io.to(roomId).emit('alarm_stopped', {
@@ -172,9 +187,8 @@ io.on('connection', (socket) => {
         scheduledAlarms: rooms[roomId].scheduledAlarms
       });
 
-      if (Object.keys(rooms[roomId].users).length === 0) {
-        delete rooms[roomId];
-      }
+      // PENTING: Kamar dan daftar jadwal alarm TETAP DISIMPAN di memori server!
+      // Jangan hapus rooms[roomId] saat kedua HP tidur/offline agar jadwal alarm jam 06.30 pagi tetap aktif!
     }
   });
 });

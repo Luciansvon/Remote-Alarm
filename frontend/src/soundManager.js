@@ -148,6 +148,13 @@ class AlarmSoundManager {
       } catch (e) {}
     });
     this.oscillators = [];
+
+    // Istirahatkan AudioContext untuk menghemat baterai saat alarm mati
+    if (this.audioCtx && this.audioCtx.state === 'running') {
+      try {
+        this.audioCtx.suspend();
+      } catch (e) {}
+    }
   }
 }
 
