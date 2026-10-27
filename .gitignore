@@ -1,0 +1,26 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build Outputs
+dist/
+build/
+*.apk
+
+# Android Studio / Gradle
+.gradle/
+local.properties
+.idea/
+*.iml
+.DS_Store
+captures/
+frontend/android/build/
+frontend/android/app/build/
+frontend/android/capacitor-android/build/
+frontend/android/capacitor-cordova-android-plugins/build/
+
+# Temporary screenshots & logs
+*.log
+screen_*.png
