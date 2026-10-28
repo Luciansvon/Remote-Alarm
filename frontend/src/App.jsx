@@ -120,7 +120,11 @@ export default function App() {
     }
 
     const socket = io(serverUrl, {
-      transports: ['websocket', 'polling']
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 4000,
+      timeout: 10000
     });
     socketRef.current = socket;
 
@@ -206,18 +210,20 @@ export default function App() {
     };
   }, [serverUrl, roomId, roomPin, currentRole]);
 
-  // Coba sambung ulang saat jaringan kembali atau aplikasi dibuka lagi
+  // Coba sambung ulang saat jaringan kembali, aplikasi dibuka lagi, atau berkala setiap 5s jika offline
   useEffect(() => {
     const tryReconnect = () => {
-      if (navigator.onLine && document.visibilityState === 'visible' && socketRef.current && !socketRef.current.connected) {
+      if (socketRef.current && !socketRef.current.connected) {
         socketRef.current.connect();
       }
     };
     window.addEventListener('online', tryReconnect);
     document.addEventListener('visibilitychange', tryReconnect);
+    const retryInterval = setInterval(tryReconnect, 5000);
     return () => {
       window.removeEventListener('online', tryReconnect);
       document.removeEventListener('visibilitychange', tryReconnect);
+      clearInterval(retryInterval);
     };
   }, []);
 
