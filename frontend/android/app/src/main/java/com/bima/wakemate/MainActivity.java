@@ -31,9 +31,10 @@ public class MainActivity extends BridgeActivity {
         }
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
-        // Izinkan pemutaran audio otomatis tanpa perlu sentuhan layar
+        // Izinkan pemutaran audio otomatis tanpa perlu sentuhan layar dan izinkan websocket lokal
         if (getBridge() != null && getBridge().getWebView() != null) {
             getBridge().getWebView().getSettings().setMediaPlaybackRequiresUserGesture(false);
+            getBridge().getWebView().getSettings().setMixedContentMode(android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         }
 
         // Paksa volume media Android (STREAM_MUSIC) ke tingkat maksimal

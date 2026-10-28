@@ -1,5 +1,9 @@
 {
   "appId": "com.bima.wakemate",
   "appName": "Wake-Mate",
-  "webDir": "dist"
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true
+  }
 }
