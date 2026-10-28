@@ -73,17 +73,19 @@ class AlarmSoundManager {
     const osc = this.audioCtx.createOscillator();
     osc.type = 'sawtooth';
     osc.frequency.setValueAtTime(600, this.audioCtx.currentTime);
-
-    const now = this.audioCtx.currentTime;
-    for (let i = 0; i < 60; i++) {
-      const t = now + i * 0.8;
-      osc.frequency.exponentialRampToValueAtTime(1200, t + 0.4);
-      osc.frequency.exponentialRampToValueAtTime(600, t + 0.8);
-    }
-
     osc.connect(this.gainNode);
     osc.start();
     this.oscillators.push(osc);
+
+    const sweep = () => {
+      if (!this.isPlaying) return;
+      const now = this.audioCtx.currentTime;
+      osc.frequency.exponentialRampToValueAtTime(1200, now + 0.4);
+      osc.frequency.exponentialRampToValueAtTime(600, now + 0.8);
+    };
+
+    sweep();
+    this.intervalId = setInterval(sweep, 800);
   }
 
   playClockBeeps() {

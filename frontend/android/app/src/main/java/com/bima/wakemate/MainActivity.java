@@ -1,6 +1,8 @@
 package com.bima.wakemate;
 
+import android.Manifest;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -8,11 +10,19 @@ import android.view.WindowManager;
 import com.getcapacitor.BridgeActivity;
 
 public class MainActivity extends BridgeActivity {
+    private static final int NOTIFICATION_PERMISSION_REQUEST_CODE = 100;
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
         // Daftarkan plugin native kustom WakeMate sebelum inisialisasi Bridge
         registerPlugin(WakeMateNativePlugin.class);
         super.onCreate(savedInstanceState);
+
+        // API 33+: izin notifikasi wajib agar alarm bisa tampil di layar kunci
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS }, NOTIFICATION_PERMISSION_REQUEST_CODE);
+        }
 
         // Nyalakan layar dan tampilkan di atas layar kunci saat alarm aktif
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {

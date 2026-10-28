@@ -1,7 +1,7 @@
-const express = require('express');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { Server } = require('socket.io');
-const cors = require('cors');
 const crypto = require('crypto');
 
 // Konfigurasi CORS (AUD-03): Membaca process.env.ALLOWED_ORIGINS jika didefinisikan
@@ -10,13 +10,6 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
       ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
       : process.env.ALLOWED_ORIGINS.trim())
   : '*';
-
-const app = express();
-app.use(cors({
-  origin: allowedOrigins,
-  methods: ['GET', 'POST']
-}));
-app.use(express.json({ limit: '20mb' }));
 
 // Helper enkripsi hash PIN kamar (AUD-01)
 function hashPin(pin) {
@@ -27,6 +20,12 @@ function hashPin(pin) {
 const MAX_SCHEDULED_PER_ROOM = 10;
 const ROOM_IDLE_TTL_MS = 48 * 60 * 60 * 1000; // 48 Jam
 const SCHEDULE_CLEANUP_TTL_MS = 3600_000; // 1 Jam
+const MAX_ROOMS = 1000;
+const MAX_ROOM_ID_LENGTH = 32;
+const MIN_NEW_ROOM_PIN_LENGTH = 6;
+const JOIN_FAILURE_LIMIT = 5;
+const JOIN_FAILURE_WINDOW_MS = 60000;
+const ALARM_ACTIVE_TTL_MS = 3600_000; // 1 Jam
 
 // Regex dan sanitasi Audio Data URI (AUD-04)
 const AUDIO_DATA_URL_REGEX = /^data:audio\/(webm|ogg|mp3|mpeg|wav|mp4|aac|x-m4a);base64,[A-Za-z0-9+/=]+$/i;
@@ -36,6 +35,11 @@ function sanitizeVoiceDataUrl(rawUrl) {
   const trimmed = rawUrl.trim();
   if (!trimmed) return null;
   return AUDIO_DATA_URL_REGEX.test(trimmed) ? trimmed : null;
+}
+
+// Payload daftar jadwal tidak boleh membawa audio Base64
+function publicAlarms(list = []) {
+  return list.map(({ voiceDataUrl, ...alarm }) => alarm);
 }
 
 // Helper pembatas frekuensi aksi per socket (AUD-03)
@@ -50,7 +54,21 @@ function isRateLimited(socket, minIntervalMs = 2000) {
   return false;
 }
 
-const server = http.createServer(app);
+const server = http.createServer((req, res) => {
+  const pathname = (req.url || '').split('?')[0];
+  if (req.method === 'GET' && pathname === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: 'online',
+      activeRooms: Object.keys(rooms).length,
+      timestamp: new Date().toISOString()
+    }));
+    return;
+  }
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
+});
+
 const io = new Server(server, {
   cors: {
     origin: allowedOrigins,
@@ -61,6 +79,86 @@ const io = new Server(server, {
 
 // Menyimpan data ruangan pasangan, status alarm, dan jadwal alarm
 const rooms = {};
+
+// Persistensi PIN & jadwal (users/status alarm tidak disimpan)
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'rooms.json');
+const PERSIST = require.main === module;
+
+// shortcut: custom alarm audio is not persisted, so after a server restart voice/TikTok schedules fall back to the siren; add a blob store if this matters.
+function serializeRooms() {
+  const data = {};
+  for (const roomId in rooms) {
+    data[roomId] = {
+      pinHash: rooms[roomId].pinHash,
+      scheduledAlarms: (rooms[roomId].scheduledAlarms || [])
+        .filter(a => !a.fired)
+        .map(({ voiceDataUrl, ...alarm }) => alarm)
+    };
+  }
+  return data;
+}
+
+let saveTimer = null;
+function saveRooms() {
+  if (!PERSIST || saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    const tmpFile = DATA_FILE + '.tmp';
+    try {
+      fs.writeFileSync(tmpFile, JSON.stringify(serializeRooms()));
+      fs.renameSync(tmpFile, DATA_FILE);
+    } catch (err) {
+      console.error(`[PERSIST] Gagal menyimpan data rooms: ${err.message}`);
+    }
+  }, 250);
+  if (saveTimer.unref) saveTimer.unref();
+}
+
+function loadRooms() {
+  if (!PERSIST) return;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    const now = Date.now();
+    for (const roomId in parsed) {
+      const saved = parsed[roomId] || {};
+      rooms[roomId] = {
+        pinHash: saved.pinHash,
+        users: {},
+        isAlarmActive: false,
+        currentAlarm: null,
+        scheduledAlarms: (Array.isArray(saved.scheduledAlarms) ? saved.scheduledAlarms : [])
+          .filter(a => !a.fired)
+          .map(({ voiceDataUrl, ...alarm }) => alarm),
+        lastActivityAt: now
+      };
+    }
+    console.log(`[PERSIST] ${Object.keys(rooms).length} room dimuat dari ${DATA_FILE}`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.error(`[PERSIST] Data rooms korup, mulai dengan state kosong: ${err.message}`);
+    }
+  }
+}
+loadRooms();
+
+// Rate limit percobaan PIN gagal per alamat klien
+const joinFailures = new Map();
+
+function pruneJoinFailures(now) {
+  for (const [address, record] of joinFailures) {
+    if (now - record.windowStart > JOIN_FAILURE_WINDOW_MS) joinFailures.delete(address);
+  }
+}
+
+function recordJoinFailure(address) {
+  const now = Date.now();
+  let record = joinFailures.get(address);
+  if (!record || now - record.windowStart > JOIN_FAILURE_WINDOW_MS) {
+    record = { count: 0, windowStart: now };
+  }
+  record.count += 1;
+  joinFailures.set(address, record);
+}
 
 // Cek otomatis setiap 1 detik untuk alarm yang dijadwalkan & pemeliharaan memori (AUD-02)
 const maintenanceInterval = setInterval(() => {
@@ -104,11 +202,24 @@ const maintenanceInterval = setInterval(() => {
       }
 
       if (scheduleUpdated) {
-        io.to(roomId).emit('scheduled_list_updated', room.scheduledAlarms);
+        io.to(roomId).emit('scheduled_list_updated', publicAlarms(room.scheduledAlarms));
+        saveRooms();
       }
     }
 
-    // 2. Pembersihan kamar pasif jika tidak ada user, tidak ada jadwal tertunda, tidak ada alarm aktif, dan > 48 jam idle
+    // 2. Batalkan alarm aktif yang menggantung lebih dari 1 jam
+    if (room.isAlarmActive) {
+      const alarmAt = (room.currentAlarm && (room.currentAlarm.timestamp || room.currentAlarm.firedAt)) || 0;
+      if (now - alarmAt > ALARM_ACTIVE_TTL_MS) {
+        room.isAlarmActive = false;
+        room.currentAlarm = null;
+        console.log(`[ALARM TIMEOUT] Alarm Room ${roomId} dihentikan server karena aktif > 1 jam.`);
+        io.to(roomId).emit('alarm_stopped', { stopper: 'Server (timeout)', timestamp: now });
+        saveRooms();
+      }
+    }
+
+    // 3. Pembersihan kamar pasif jika tidak ada user, tidak ada jadwal tertunda, tidak ada alarm aktif, dan > 48 jam idle
     const hasUsers = room.users && Object.keys(room.users).length > 0;
     const hasPendingSchedules = room.scheduledAlarms && room.scheduledAlarms.some(a => !a.fired);
     const hasActiveAlarm = room.isAlarmActive || !!room.currentAlarm;
@@ -117,33 +228,50 @@ const maintenanceInterval = setInterval(() => {
     if (!hasUsers && !hasPendingSchedules && !hasActiveAlarm && isIdleExpired) {
       console.log(`[CLEANUP] Room ${roomId} dihapus karena tidak aktif melebihi 48 jam.`);
       delete rooms[roomId];
+      saveRooms();
     }
   }
 }, 1000);
 if (maintenanceInterval.unref) maintenanceInterval.unref();
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'online',
-    activeRooms: Object.keys(rooms).length,
-    timestamp: new Date().toISOString()
-  });
-});
 
 io.on('connection', (socket) => {
   console.log(`[Koneksi Baru] ID Klien: ${socket.id}`);
 
   // Bergabung ke ruangan pasangan dengan verifikasi PIN rahasia (AUD-01)
   socket.on('join_room', (data = {}) => {
-    const roomId = String(data.roomId || '').trim().toUpperCase();
-    const username = String(data.username || 'Pasangan').trim().slice(0, 50);
-    const pin = String(data.pin || '1234').trim();
-    const pinHash = hashPin(pin);
+    const address = socket.handshake?.address || 'unknown';
+    pruneJoinFailures(Date.now());
 
-    if (!roomId) return;
+    const failure = joinFailures.get(address);
+    if (failure && failure.count >= JOIN_FAILURE_LIMIT) {
+      socket.emit('auth_error', { message: 'Terlalu banyak percobaan PIN. Coba lagi nanti.' });
+      return;
+    }
+
+    const roomId = String(data.roomId || '').trim().toUpperCase().slice(0, MAX_ROOM_ID_LENGTH);
+    const username = String(data.username || 'Pasangan').trim().slice(0, 50);
+    const pin = String(data.pin ?? '').trim();
+
+    if (!roomId || !pin) {
+      recordJoinFailure(address);
+      socket.emit('auth_error', { message: 'Room ID dan PIN wajib diisi.' });
+      return;
+    }
+
+    const pinHash = hashPin(pin);
 
     if (!rooms[roomId]) {
       // Buat kamar baru dengan kunci PIN yang didaftarkan pertama kali
+      if (pin.length < MIN_NEW_ROOM_PIN_LENGTH) {
+        recordJoinFailure(address);
+        socket.emit('auth_error', { message: `PIN kamar baru minimal ${MIN_NEW_ROOM_PIN_LENGTH} karakter.` });
+        return;
+      }
+      if (Object.keys(rooms).length >= MAX_ROOMS) {
+        recordJoinFailure(address);
+        socket.emit('auth_error', { message: 'Server penuh. Coba lagi nanti.' });
+        return;
+      }
       rooms[roomId] = {
         pinHash,
         users: {},
@@ -152,8 +280,10 @@ io.on('connection', (socket) => {
         scheduledAlarms: [],
         lastActivityAt: Date.now()
       };
+      saveRooms();
     } else if (rooms[roomId].pinHash && rooms[roomId].pinHash !== pinHash) {
       // Tolak jika PIN tidak cocok dengan kamar yang sudah ada
+      recordJoinFailure(address);
       console.log(`[AUTH DITOLAK] PIN salah untuk Room ${roomId} dari ${username} (${socket.id})`);
       socket.emit('auth_error', { 
         message: 'PIN kamar salah! Pastikan PIN di HP Bima dan HP Pacar sama persis.' 
@@ -161,8 +291,15 @@ io.on('connection', (socket) => {
       return;
     }
 
+    joinFailures.delete(address);
+
     socket.join(roomId);
-    socket.data = { ...(socket.data || {}), roomId, username };
+    socket.data = {
+      ...(socket.data || {}),
+      roomId,
+      username,
+      deviceId: String(data.deviceId || socket.id).slice(0, 64)
+    };
 
     rooms[roomId].users[socket.id] = { 
       id: socket.id,
@@ -178,7 +315,7 @@ io.on('connection', (socket) => {
       users: Object.values(rooms[roomId].users),
       isAlarmActive: rooms[roomId].isAlarmActive,
       currentAlarm: rooms[roomId].currentAlarm,
-      scheduledAlarms: rooms[roomId].scheduledAlarms
+      scheduledAlarms: publicAlarms(rooms[roomId].scheduledAlarms)
     });
   });
 
@@ -200,6 +337,7 @@ io.on('connection', (socket) => {
     const alarmPayload = {
       id: 'instan_' + Date.now(),
       senderSocketId: socket.id, // AUD-07: Catat ID koneksi fisik perangkat pengirim
+      senderDeviceId: socket.data.deviceId, // Identitas perangkat dari sesi join, bukan dari klien
       sender: data.sender || socket.data?.username || 'Bima',
       target: data.target || data.targetName || 'Pacar',
       volume: typeof data.volume === 'number' ? data.volume : 100,
@@ -246,6 +384,7 @@ io.on('connection', (socket) => {
     const newAlarm = {
       id: 'sch_' + Date.now(),
       creatorSocketId: socket.id,
+      senderDeviceId: socket.data.deviceId, // Identitas perangkat dari sesi join
       creator: data.creator || socket.data?.username || 'Bima',
       sender: data.creator || socket.data?.username || 'Bima',
       target: data.target || data.targetName || 'Pacar',
@@ -265,7 +404,8 @@ io.on('connection', (socket) => {
     rooms[roomId].lastActivityAt = Date.now();
     console.log(`[JADWAL DIBUAT] Room ${roomId} oleh ${newAlarm.creator} untuk jam ${newAlarm.timeString}`);
 
-    io.to(roomId).emit('scheduled_list_updated', rooms[roomId].scheduledAlarms);
+    io.to(roomId).emit('scheduled_list_updated', publicAlarms(rooms[roomId].scheduledAlarms));
+    saveRooms();
   });
 
   // Menghapus alarm yang dijadwalkan
@@ -275,7 +415,8 @@ io.on('connection', (socket) => {
     if (roomId && rooms[roomId] && alarmId) {
       rooms[roomId].scheduledAlarms = rooms[roomId].scheduledAlarms.filter(a => a.id !== alarmId);
       rooms[roomId].lastActivityAt = Date.now();
-      io.to(roomId).emit('scheduled_list_updated', rooms[roomId].scheduledAlarms);
+      io.to(roomId).emit('scheduled_list_updated', publicAlarms(rooms[roomId].scheduledAlarms));
+      saveRooms();
     }
   });
 
@@ -297,6 +438,7 @@ io.on('connection', (socket) => {
       stopperSocketId: socket.id,
       timestamp: Date.now()
     });
+    saveRooms();
   });
 
   socket.on('disconnect', () => {
@@ -309,7 +451,7 @@ io.on('connection', (socket) => {
         users: Object.values(rooms[roomId].users),
         isAlarmActive: rooms[roomId].isAlarmActive,
         currentAlarm: rooms[roomId].currentAlarm,
-        scheduledAlarms: rooms[roomId].scheduledAlarms
+        scheduledAlarms: publicAlarms(rooms[roomId].scheduledAlarms)
       });
 
       // PENTING: Kamar dan daftar jadwal alarm TETAP DISIMPAN di memori server!
@@ -326,14 +468,20 @@ if (require.main === module) {
 }
 
 module.exports = {
-  app,
   server,
   io,
   rooms,
   isRateLimited,
   sanitizeVoiceDataUrl,
+  publicAlarms,
   MAX_SCHEDULED_PER_ROOM,
   ROOM_IDLE_TTL_MS,
   SCHEDULE_CLEANUP_TTL_MS,
+  MAX_ROOMS,
+  MAX_ROOM_ID_LENGTH,
+  MIN_NEW_ROOM_PIN_LENGTH,
+  JOIN_FAILURE_LIMIT,
+  JOIN_FAILURE_WINDOW_MS,
+  ALARM_ACTIVE_TTL_MS,
   hashPin
 };

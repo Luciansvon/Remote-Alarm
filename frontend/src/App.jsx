@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
 import confetti from 'canvas-confetti';
 import { 
@@ -21,19 +21,33 @@ import {
   Upload,
   Pause
 } from 'lucide-react';
-import { registerPlugin } from '@capacitor/core';
+import { Capacitor, registerPlugin } from '@capacitor/core';
 import { soundManager } from './soundManager';
-import './App.css';
 
 // Jembatan Native Android WakeMate (AUD-06)
 const WakeMateNative = registerPlugin('WakeMateNative');
 
+// ID perangkat stabil: server memakai ini untuk membedakan pengirim alarm
+const getDeviceId = () => {
+  try {
+    const saved = localStorage.getItem('wakemate_device_id');
+    if (saved) return saved;
+    const id = window.crypto?.randomUUID
+      ? window.crypto.randomUUID()
+      : `dev-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem('wakemate_device_id', id);
+    return id;
+  } catch (_) {
+    return `dev-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+};
+
+const DEVICE_ID = getDeviceId();
+
 // AUD-05: Konfigurasi URL server fleksibel dengan dukungan environment variable
 const defaultServer = localStorage.getItem('wakemate_server') || (
   import.meta.env?.VITE_DEFAULT_SERVER_URL || (
-    window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-      ? 'http://192.168.0.23:4000'
-      : `http://${window.location.hostname}:4000`
+    Capacitor.isNativePlatform() ? '' : `http://${window.location.hostname}:4000`
   )
 );
 
@@ -41,8 +55,9 @@ export default function App() {
   // Pengaturan Kamar & Peran (AUD-01)
   const [roomId, setRoomId] = useState('CINTA-BIMA');
   const [tempRoomId, setTempRoomId] = useState('CINTA-BIMA');
-  const [roomPin, setRoomPin] = useState(localStorage.getItem('wakemate_pin') || '1234');
-  const [tempRoomPin, setTempRoomPin] = useState(localStorage.getItem('wakemate_pin') || '1234');
+  // PIN tidak dibuat otomatis: kedua HP harus memakai PIN yang sama dan bisa dibaca pengguna
+  const [roomPin, setRoomPin] = useState(() => localStorage.getItem('wakemate_pin') || '');
+  const [tempRoomPin, setTempRoomPin] = useState(() => roomPin);
   const [authError, setAuthError] = useState(null);
   const [currentRole, setCurrentRole] = useState('bima'); // 'bima', 'pacar', 'simulasi'
 
@@ -76,6 +91,7 @@ export default function App() {
   const [voiceDataUrl, setVoiceDataUrl] = useState(null);
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
+  const recordingTimerRef = useRef(null);
 
   // Preview Audio Controller (Hanya berbunyi jika Bima klik tombol Putar, tidak pernah otomatis)
   const [previewAudioEl, setPreviewAudioEl] = useState(null);
@@ -97,9 +113,14 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!serverUrl || !roomPin) {
+      socketRef.current = null;
+      setIsConnected(false);
+      return;
+    }
+
     const socket = io(serverUrl, {
-      transports: ['websocket', 'polling'],
-      reconnectionAttempts: 10
+      transports: ['websocket', 'polling']
     });
     socketRef.current = socket;
 
@@ -108,12 +129,14 @@ export default function App() {
       setAuthError(null);
       const username = currentRole === 'bima' ? 'Bima' : 'Pacar';
       // AUD-01: Kirim roomId dan PIN terotentikasi
-      socket.emit('join_room', { roomId, username, pin: roomPin });
+      socket.emit('join_room', { roomId, username, pin: roomPin, deviceId: DEVICE_ID });
 
       // AUD-06: Jalankan Foreground Service siaga saat terhubung
-      try {
-        WakeMateNative.startForegroundService().catch(() => {});
-      } catch (_) {}
+      if (Capacitor.isNativePlatform()) {
+        try {
+          WakeMateNative.startForegroundService().catch(() => {});
+        } catch (_) {}
+      }
     });
 
     socket.on('auth_error', (data) => {
@@ -140,7 +163,7 @@ export default function App() {
       if (data.roomId === roomId) {
         setAuthError(null);
         setScheduledAlarms(data.scheduledAlarms || []);
-        if (data.isAlarmActive && data.currentAlarm) {
+        if (data.isAlarmActive && data.currentAlarm && data.currentAlarm.senderDeviceId !== DEVICE_ID) {
           triggerLocalAlarm(data.currentAlarm);
         }
       }
@@ -154,7 +177,7 @@ export default function App() {
       // AUD-07: Periksa apakah perangkat fisik ini adalah pengirim alarm murni
       const myName = currentRole === 'bima' ? 'Bima' : 'Pacar';
       const isSender = currentRole !== 'simulasi' && (
-        data?.senderSocketId ? data.senderSocketId === socket.id : (data?.target && data.target !== myName)
+        data?.senderDeviceId ? data.senderDeviceId === DEVICE_ID : data?.senderSocketId ? data.senderSocketId === socket.id : (data?.target && data.target !== myName)
       );
 
       if (isSender) {
@@ -175,11 +198,31 @@ export default function App() {
     return () => {
       socket.disconnect();
       stopPreviewAudio();
-      try {
-        WakeMateNative.stopForegroundService().catch(() => {});
-      } catch (_) {}
+      if (Capacitor.isNativePlatform()) {
+        try {
+          WakeMateNative.stopForegroundService().catch(() => {});
+        } catch (_) {}
+      }
     };
   }, [serverUrl, roomId, roomPin, currentRole]);
+
+  // Coba sambung ulang saat jaringan kembali atau aplikasi dibuka lagi
+  useEffect(() => {
+    const tryReconnect = () => {
+      if (navigator.onLine && document.visibilityState === 'visible' && socketRef.current && !socketRef.current.connected) {
+        socketRef.current.connect();
+      }
+    };
+    window.addEventListener('online', tryReconnect);
+    document.addEventListener('visibilitychange', tryReconnect);
+    return () => {
+      window.removeEventListener('online', tryReconnect);
+      document.removeEventListener('visibilitychange', tryReconnect);
+    };
+  }, []);
+
+  // Bersihkan timer rekaman saat komponen dibongkar
+  useEffect(() => () => clearTimeout(recordingTimerRef.current), []);
 
   // Kontrol Preview Suara Manual
   const stopPreviewAudio = () => {
@@ -233,9 +276,15 @@ export default function App() {
     setWakeUpNotice(null);
 
     // AUD-06: Paksa volume perangkat fisik ke tingkat maksimal 100% pada detik alarm berdering
-    try {
-      WakeMateNative.maximizeVolume().catch(() => {});
-    } catch (_) {}
+    if (Capacitor.isNativePlatform()) {
+      try {
+        WakeMateNative.maximizeVolume().catch(() => {});
+        WakeMateNative.showAlarmNotification({
+          title: `Alarm dari ${data.sender || 'Pasangan'}`,
+          message: data.message || 'Waktunya bangun!'
+        }).catch(() => {});
+      } catch (_) {}
+    }
 
     const volume = data.volume || 100;
     const soundType = data.sound || 'siren';
@@ -252,6 +301,12 @@ export default function App() {
     setAlarmData(null);
     setMissionCount(0);
     soundManager.stop();
+
+    if (Capacitor.isNativePlatform()) {
+      try {
+        WakeMateNative.stopAlarmNotification().catch(() => {});
+      } catch (_) {}
+    }
 
     if ('vibrate' in navigator) {
       navigator.vibrate(0);
@@ -282,17 +337,28 @@ export default function App() {
       };
 
       mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-        const reader = new FileReader();
-        reader.readAsDataURL(audioBlob);
-        reader.onloadend = () => {
-          setVoiceDataUrl(reader.result);
-          setSelectedSound('voice');
-        };
         stream.getTracks().forEach(track => track.stop());
+        clearTimeout(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        if (audioBlob.size > 8 * 1024 * 1024) {
+          alert("Rekaman terlalu besar (maksimal 8MB). Coba rekam lebih singkat ya!");
+        } else {
+          const reader = new FileReader();
+          reader.readAsDataURL(audioBlob);
+          reader.onloadend = () => {
+            setVoiceDataUrl(reader.result);
+            setSelectedSound('voice');
+          };
+        }
       };
 
-      mediaRecorder.start();
+      mediaRecorder.start(1000);
+      clearTimeout(recordingTimerRef.current);
+      recordingTimerRef.current = setTimeout(() => {
+        mediaRecorderRef.current?.stop();
+        setIsRecording(false);
+      }, 60000);
       setIsRecording(true);
     } catch (err) {
       console.error("Gagal akses mikrofon:", err);
@@ -302,6 +368,7 @@ export default function App() {
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && isRecording) {
+      clearTimeout(recordingTimerRef.current);
       mediaRecorderRef.current.stop();
       setIsRecording(false);
     }
@@ -393,7 +460,12 @@ export default function App() {
     e.preventDefault();
     if (!tempRoomId.trim()) return;
     const cleanRoom = tempRoomId.toUpperCase().trim();
-    const cleanPin = tempRoomPin.trim() || '1234';
+    const cleanPin = tempRoomPin.trim();
+
+    if (!cleanPin) {
+      alert("PIN kamar tidak boleh kosong ya!");
+      return;
+    }
 
     localStorage.setItem('wakemate_pin', cleanPin);
     setRoomId(cleanRoom);
@@ -429,7 +501,7 @@ export default function App() {
   };
 
   // Tampilan Layar Darurat Saat Alarm Berdering
-  if (isAlarmActive && currentRole !== 'simulasi') {
+  if (isAlarmActive) {
     return (
       <div className="alarm-ringing-bg">
         <div className="nb-card pulse-alarm" style={{ maxWidth: '420px', width: '100%', textAlign: 'center', padding: '28px 20px', backgroundColor: '#FFFFFF' }}>
@@ -508,6 +580,20 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {(!serverUrl || !roomPin) && (
+        <div className="nb-card-sm" style={{ backgroundColor: '#FF5757', color: '#FFF', marginBottom: '14px', textAlign: 'center', fontWeight: 800, fontSize: '0.9rem', border: '2.5px solid #000' }}>
+          {!serverUrl ? 'Alamat server belum diatur' : 'PIN kamar belum diatur'}{' '}
+          <button
+            type="button"
+            onClick={() => switchTab('settings')}
+            className="nb-button"
+            style={{ padding: '4px 10px', fontSize: '0.8rem', marginLeft: '6px' }}
+          >
+            Atur
+          </button>
+        </div>
+      )}
 
       {/* KONTEN BERDASARKAN TAB NAVIGASI */}
 
@@ -697,38 +783,14 @@ export default function App() {
           </div>
 
           {/* Kartu Volume & Misi Bangun */}
-          <div className="nb-card">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-              <label style={{ fontWeight: 800, fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <Volume2 size={16} /> Volume Suara:
-              </label>
-              <span className="nb-badge" style={{ backgroundColor: selectedVolume >= 90 ? '#FF5757' : '#FFE600', color: selectedVolume >= 90 ? '#FFF' : '#000' }}>
-                {selectedVolume}% {selectedVolume === 100 ? '⚡ FULL' : ''}
-              </span>
-            </div>
-            <input 
-              type="range" 
-              min="50" 
-              max="100" 
-              step="5" 
-              value={selectedVolume}
-              onChange={(e) => setSelectedVolume(Number(e.target.value))}
-              style={{ width: '100%', accentColor: '#000000', cursor: 'pointer', height: '8px', marginBottom: '14px' }}
-            />
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', paddingTop: '8px', borderTop: '2px dashed #EEE' }}>
-              <input 
-                type="checkbox" 
-                id="missionCheckInstant" 
-                checked={missionRequired}
-                onChange={(e) => setMissionRequired(e.target.checked)}
-                style={{ width: '20px', height: '20px', accentColor: '#000', cursor: 'pointer' }}
-              />
-              <label htmlFor="missionCheckInstant" style={{ fontWeight: 800, fontSize: '0.85rem', cursor: 'pointer' }}>
-                🎯 Wajib ketuk tombol 3x agar alarm mati
-              </label>
-            </div>
-          </div>
+          <VolumeMissionControl
+            label="Volume Suara"
+            volume={selectedVolume}
+            setVolume={setSelectedVolume}
+            mission={missionRequired}
+            setMission={setMissionRequired}
+            id="missionCheckInstant"
+          />
 
           {/* Tombol Utama Raksasa Bunyikan Sekarang */}
           <button 
@@ -766,6 +828,10 @@ export default function App() {
               <button type="button" onClick={() => setQuickTime('0600')} className="nb-chip">06:00 Pagi</button>
               <button type="button" onClick={() => setQuickTime('0700')} className="nb-chip">07:00 Pagi</button>
             </div>
+
+            <p style={{ fontSize: '0.75rem', color: '#666', marginTop: '10px' }}>
+              Jam mengikuti waktu HP ini (pengirim).
+            </p>
           </div>
 
           {/* Kartu Pesan Jadwal */}
@@ -820,38 +886,14 @@ export default function App() {
           </div>
 
           {/* Kartu Volume & Misi Bangun untuk Jadwal */}
-          <div className="nb-card">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-              <label style={{ fontWeight: 800, fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <Volume2 size={16} /> Volume Jam Bangun:
-              </label>
-              <span className="nb-badge" style={{ backgroundColor: selectedVolume >= 90 ? '#FF5757' : '#FFE600', color: selectedVolume >= 90 ? '#FFF' : '#000' }}>
-                {selectedVolume}% {selectedVolume === 100 ? '⚡ FULL' : ''}
-              </span>
-            </div>
-            <input 
-              type="range" 
-              min="50" 
-              max="100" 
-              step="5" 
-              value={selectedVolume}
-              onChange={(e) => setSelectedVolume(Number(e.target.value))}
-              style={{ width: '100%', accentColor: '#000000', cursor: 'pointer', height: '8px', marginBottom: '14px' }}
-            />
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', paddingTop: '8px', borderTop: '2px dashed #EEE' }}>
-              <input 
-                type="checkbox" 
-                id="missionCheckSchedule" 
-                checked={missionRequired}
-                onChange={(e) => setMissionRequired(e.target.checked)}
-                style={{ width: '20px', height: '20px', accentColor: '#000', cursor: 'pointer' }}
-              />
-              <label htmlFor="missionCheckSchedule" style={{ fontWeight: 800, fontSize: '0.85rem', cursor: 'pointer' }}>
-                🎯 Wajib ketuk tombol 3x agar alarm mati
-              </label>
-            </div>
-          </div>
+          <VolumeMissionControl
+            label="Volume Jam Bangun"
+            volume={selectedVolume}
+            setVolume={setSelectedVolume}
+            mission={missionRequired}
+            setMission={setMissionRequired}
+            id="missionCheckSchedule"
+          />
 
           {/* Tombol Pasang Jadwal */}
           <button 
@@ -986,6 +1028,7 @@ export default function App() {
                 onChange={(e) => setTempRoomId(e.target.value)}
                 className="nb-input"
                 placeholder="MISAL: CINTA-BIMA"
+                maxLength={32}
                 style={{ textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '10px' }}
               />
 
@@ -997,10 +1040,13 @@ export default function App() {
                 value={tempRoomPin}
                 onChange={(e) => setTempRoomPin(e.target.value)}
                 className="nb-input"
-                placeholder="1234"
+                placeholder="Minimal 6 digit"
                 maxLength={10}
-                style={{ letterSpacing: '2px', marginBottom: '12px' }}
+                style={{ letterSpacing: '2px', marginBottom: '6px' }}
               />
+              <p style={{ fontSize: '0.75rem', color: '#666', marginBottom: '12px' }}>
+                Minimal 6 digit untuk kamar baru.
+              </p>
 
               <button 
                 type="submit"
@@ -1033,7 +1079,7 @@ export default function App() {
                 value={tempServerUrl}
                 onChange={(e) => setTempServerUrl(e.target.value)}
                 className="nb-input"
-                placeholder="http://192.168.0.23:4000"
+                placeholder="http://IP-KOMPUTER:4000"
                 style={{ marginBottom: '10px' }}
               />
               <button 
@@ -1106,6 +1152,43 @@ export default function App() {
         </button>
       </nav>
 
+    </div>
+  );
+}
+
+function VolumeMissionControl({ label, volume, setVolume, mission, setMission, id }) {
+  return (
+    <div className="nb-card">
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+        <label style={{ fontWeight: 800, fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <Volume2 size={16} /> {label}:
+        </label>
+        <span className="nb-badge" style={{ backgroundColor: volume >= 90 ? '#FF5757' : '#FFE600', color: volume >= 90 ? '#FFF' : '#000' }}>
+          {volume}% {volume === 100 ? '⚡ FULL' : ''}
+        </span>
+      </div>
+      <input
+        type="range"
+        min="50"
+        max="100"
+        step="5"
+        value={volume}
+        onChange={(e) => setVolume(Number(e.target.value))}
+        style={{ width: '100%', accentColor: '#000000', cursor: 'pointer', height: '8px', marginBottom: '14px' }}
+      />
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', paddingTop: '8px', borderTop: '2px dashed #EEE' }}>
+        <input
+          type="checkbox"
+          id={id}
+          checked={mission}
+          onChange={(e) => setMission(e.target.checked)}
+          style={{ width: '20px', height: '20px', accentColor: '#000', cursor: 'pointer' }}
+        />
+        <label htmlFor={id} style={{ fontWeight: 800, fontSize: '0.85rem', cursor: 'pointer' }}>
+          🎯 Wajib ketuk tombol 3x agar alarm mati
+        </label>
+      </div>
     </div>
   );
 }

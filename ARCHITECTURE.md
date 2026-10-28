@@ -6,7 +6,7 @@
 - Repository: https://github.com/Luciansvon/Remote-Alarm
 - Type: Fullstack Mobile & Realtime Web Application
 - Platforms: Android (APK via Capacitor), Web Browser
-- Primary runtime/toolchain: Node.js, Express, Socket.io, React (Vite), Capacitor Android, Java 17
+- Primary runtime/toolchain: Node.js, Socket.io, React (Vite), Capacitor Android, Java 17
 
 ## System overview
 
@@ -28,7 +28,7 @@
 
 | Component | Responsibility | Technology | Notes |
 |---|---|---|---|
-| `backend/server.js` | Mengelola Room pasangan, status alarm realtime, penjadwalan alarm per detik, dan relay berkas audio kustom. | Node.js, Express, Socket.io | Port 4000, max payload 20MB |
+| `backend/server.js` | Mengelola Room pasangan, status alarm realtime, penjadwalan alarm per detik, dan relay berkas audio kustom. | Node.js, Socket.io | Port 4000, max payload 20MB, data kamar disimpan di `rooms.json` |
 | `frontend/src/App.jsx` | Antarmuka pengguna bergaya Neubrutalism, navigasi tab jempol (Kilat, Jadwal, Daftar, Profil), pengunggah audio TikTok. | React, Vite, Lucide Icons | Responsive Mobile-First |
 | `frontend/src/soundManager.js` | Synthesizer Web Audio API (Sirine, Jam Beker) dan pemutar rekaman audio/TikTok kustom. | Web Audio API / HTML5 Audio | Support MP3, WebM, WAV, AAC |
 | `frontend/android` | Shell native Android Capacitor untuk mempaketkan aplikasi ke berkas APK mandiri. | Capacitor 8, Android SDK, Gradle | Target Android API 24-36 |

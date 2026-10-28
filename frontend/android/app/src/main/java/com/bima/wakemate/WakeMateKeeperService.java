@@ -38,12 +38,23 @@ public class WakeMateKeeperService extends Service {
 
         startForeground(NOTIFICATION_ID, notification);
 
+        acquireLocks();
+    }
+
+    private void acquireLocks() {
         // Kunci prosesor agar tidak tertidur saat Doze Mode
         try {
             PowerManager powerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (powerManager != null) {
-                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WakeMate::KeeperLock");
-                wakeLock.acquire(12 * 60 * 60 * 1000L); // Maksimal 12 jam siaga malam
+                if (wakeLock == null) {
+                    wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WakeMate::KeeperLock");
+                    wakeLock.setReferenceCounted(false);
+                }
+                if (wakeLock.isHeld()) {
+                    wakeLock.release();
+                }
+                // acquire ulang memperpanjang timeout saat service di-restart sistem
+                wakeLock.acquire(24 * 60 * 60 * 1000L);
             }
         } catch (Exception e) {
             // Abaikan jika device membatasi
@@ -53,8 +64,12 @@ public class WakeMateKeeperService extends Service {
         try {
             WifiManager wifiManager = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wifiManager != null) {
-                wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "WakeMate::WifiLock");
-                wifiLock.acquire();
+                if (wifiLock == null) {
+                    wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "WakeMate::WifiLock");
+                }
+                if (!wifiLock.isHeld()) {
+                    wifiLock.acquire();
+                }
             }
         } catch (Exception e) {
             // Abaikan jika device membatasi
@@ -78,7 +93,14 @@ public class WakeMateKeeperService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // Restart oleh sistem: segarkan kembali wake lock 24 jam
+        acquireLocks();
         return START_STICKY;
+    }
+
+    @Override
+    public void onTimeout(int startId, int fgsType) {
+        stopSelf();
     }
 
     @Override

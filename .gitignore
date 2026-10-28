@@ -29,3 +29,10 @@ frontend/android/capacitor-cordova-android-plugins/build/
 # Temporary screenshots & logs
 *.log
 screen_*.png
+
+# Backend runtime data
+backend/rooms.json
+backend/rooms.json.tmp
+
+# Keep the env template (ignored by the .env.* rule above)
+!backend/.env.example
