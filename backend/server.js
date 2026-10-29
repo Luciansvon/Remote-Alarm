@@ -161,11 +161,13 @@ const server = http.createServer((req, res) => {
       sendJson(res, 403, { ok: false, error: 'PIN salah' });
       return;
     }
-    room.isAlarmActive = false;
-    room.currentAlarm = null;
-    room.lastActivityAt = Date.now();
-    io.to(roomId).emit('alarm_stopped', { stopper, timestamp: Date.now() });
-    saveRooms(true);
+    if (room.isAlarmActive) {
+      room.isAlarmActive = false;
+      room.currentAlarm = null;
+      room.lastActivityAt = Date.now();
+      io.to(roomId).emit('alarm_stopped', { stopper, timestamp: Date.now() });
+      saveRooms(true);
+    }
     sendJson(res, 200, { ok: true });
     return;
   }
@@ -803,7 +805,7 @@ io.on('connection', (socket) => {
   socket.on('stop_alarm', (data = {}) => {
     // Keamanan AUD-01: Wajib menggunakan roomId dari sesi socket yang terautentikasi
     const roomId = socket.data?.roomId;
-    if (!roomId || !rooms[roomId]) return;
+    if (!roomId || !rooms[roomId] || !rooms[roomId].isAlarmActive) return;
 
     rooms[roomId].isAlarmActive = false;
     rooms[roomId].currentAlarm = null;

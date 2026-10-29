@@ -85,6 +85,7 @@ public class WakeMateKeeperService extends Service {
     }
 
     public static synchronized void stopNativeAlarm(Context ctx) {
+        boolean hadActiveNativeAlarm = (activeAlarmKey != null || mediaPlayer != null);
         stopNativeMediaOnly();
         if (activeAlarmKey != null) {
             lastStoppedAlarmKey = activeAlarmKey;
@@ -95,6 +96,7 @@ public class WakeMateKeeperService extends Service {
             if (manager != null) {
                 manager.cancel(ALARM_NOTIFICATION_ID);
             }
+            if (!hadActiveNativeAlarm) return;
             final Context appCtx = ctx.getApplicationContext();
             new Thread(() -> {
                 try {

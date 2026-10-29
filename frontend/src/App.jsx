@@ -353,7 +353,13 @@ export default function App() {
     });
 
     socket.on('alarm_stopped', (data) => {
-      stopLocalAlarm(data?.stopper || 'Pasangan');
+      const stopper = data?.stopper || 'Pasangan';
+      if (isAlarmActiveRef.current) {
+        stopLocalAlarm(stopper);
+      } else {
+        setWakeUpNotice(`🎉 Alarm berhasil dimatikan oleh ${stopper}!`);
+        setTimeout(() => setWakeUpNotice(null), 5000);
+      }
     });
 
     return () => {
@@ -554,6 +560,7 @@ export default function App() {
 
   // Menghentikan Alarm
   const stopLocalAlarm = (stopper) => {
+    const wasActive = isAlarmActiveRef.current;
     isAlarmActiveRef.current = false;
     alarmDataRef.current = null;
     setIsAlarmActive(false);
@@ -561,19 +568,21 @@ export default function App() {
     setMissionCount(0);
     soundManager.stop();
 
+    if ('vibrate' in navigator) {
+      navigator.vibrate(0);
+    }
+
+    if (!wasActive) return;
+
     if (Capacitor.isNativePlatform()) {
       try {
         WakeMateNative.stopAlarmNotification().catch(() => {});
       } catch (_) {}
     }
 
-    if ('vibrate' in navigator) {
-      navigator.vibrate(0);
-    }
-
     confetti({
-      particleCount: 80,
-      spread: 70,
+      particleCount: 35,
+      spread: 60,
       origin: { y: 0.6 }
     });
 
