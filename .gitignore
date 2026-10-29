@@ -33,6 +33,7 @@ screen_*.png
 # Backend runtime data
 backend/rooms.json
 backend/rooms.json.tmp
+backend/audio_cache/
 
 # Keep the env template (ignored by the .env.* rule above)
 !backend/.env.example

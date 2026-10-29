@@ -22,7 +22,14 @@ import {
   Pause
 } from 'lucide-react';
 import { Capacitor, registerPlugin } from '@capacitor/core';
-import { soundManager } from './soundManager';
+import {
+  soundManager,
+  computeAudioId,
+  saveCachedAudio,
+  getCachedAudio,
+  getCachedAudioList,
+  deleteCachedAudio
+} from './soundManager';
 
 // Jembatan Native Android WakeMate (AUD-06)
 const WakeMateNative = registerPlugin('WakeMateNative');
@@ -47,19 +54,37 @@ const DEVICE_ID = getDeviceId();
 // AUD-05: Konfigurasi URL server fleksibel dengan dukungan environment variable
 const defaultServer = localStorage.getItem('wakemate_server') || (
   import.meta.env?.VITE_DEFAULT_SERVER_URL || (
-    Capacitor.isNativePlatform() ? '' : `http://${window.location.hostname}:4000`
+    Capacitor.isNativePlatform() ? 'https://alarm.birescompanny.my.id' : `http://${window.location.hostname}:4000`
   )
 );
 
+const DEFAULT_CUSTOM_TEXTS = [
+  'BANGUN SAYANG! ☀️',
+  'ADA KULIAH / KERJA! ⏰',
+  'TELPON AKU SEKARANG! 📞',
+  'JANGAN TIDUR LAGI! 🛑'
+];
+
+const loadStoredSchedules = (room) => {
+  try {
+    const raw = localStorage.getItem(`wakemate_schedules_${room}`);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_) {
+    return [];
+  }
+};
+
 export default function App() {
   // Pengaturan Kamar & Peran (AUD-01)
-  const [roomId, setRoomId] = useState('CINTA-BIMA');
-  const [tempRoomId, setTempRoomId] = useState('CINTA-BIMA');
+  const [roomId, setRoomId] = useState(() => localStorage.getItem('wakemate_room') || 'CINTA-BIMA');
+  const [tempRoomId, setTempRoomId] = useState(() => roomId);
   // PIN tidak dibuat otomatis: kedua HP harus memakai PIN yang sama dan bisa dibaca pengguna
   const [roomPin, setRoomPin] = useState(() => localStorage.getItem('wakemate_pin') || '');
   const [tempRoomPin, setTempRoomPin] = useState(() => roomPin);
   const [authError, setAuthError] = useState(null);
-  const [currentRole, setCurrentRole] = useState('bima'); // 'bima', 'pacar', 'simulasi'
+  const [currentRole, setCurrentRole] = useState(() => localStorage.getItem('wakemate_role') || 'bima'); // 'bima', 'pacar', 'simulasi'
+  const [batteryRestricted, setBatteryRestricted] = useState(false);
 
   // Pengaturan Server
   const [serverUrl, setServerUrl] = useState(defaultServer);
@@ -70,20 +95,32 @@ export default function App() {
 
   // Status Koneksi & Data
   const [isConnected, setIsConnected] = useState(false);
-  const [scheduledAlarms, setScheduledAlarms] = useState([]);
+  const [scheduledAlarms, setScheduledAlarms] = useState(() => loadStoredSchedules(roomId));
   
   // Pengaturan Alarm
   const [selectedVolume, setSelectedVolume] = useState(100);
   const [selectedSound, setSelectedSound] = useState('siren'); // 'siren', 'alarm_clock', 'tiktok', 'voice'
-  const [customMessage, setCustomMessage] = useState('BANGUN SAYANG! UDAH SIANG!');
+  const [customMessage, setCustomMessage] = useState(() => localStorage.getItem('wakemate_custom_msg') || 'BANGUN SAYANG! UDAH SIANG!');
+  const [customTexts, setCustomTexts] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('wakemate_custom_texts'));
+      return Array.isArray(saved) && saved.length > 0 ? saved : DEFAULT_CUSTOM_TEXTS;
+    } catch (_) {
+      return DEFAULT_CUSTOM_TEXTS;
+    }
+  });
+  const [receivedCustomText, setReceivedCustomText] = useState(null);
   const [missionRequired, setMissionRequired] = useState(true); // Wajib ketuk 3x
 
   // Jadwal Jam & Menit
   const [scheduleTime, setScheduleTime] = useState('06:30');
 
-  // Suara Kustom TikTok / Berkas Audio Sendiri
+  // Suara Kustom TikTok / Berkas Audio Sendiri & Cache Lokal
   const [tiktokAudioDataUrl, setTiktokAudioDataUrl] = useState(null);
   const [tiktokAudioFileName, setTiktokAudioFileName] = useState('');
+  const [savedAudios, setSavedAudios] = useState(() => getCachedAudioList());
+  const [activeAudioId, setActiveAudioId] = useState(() => localStorage.getItem('wakemate_active_audio_id') || null);
+  const [serverCachedAudioIds, setServerCachedAudioIds] = useState([]);
   const fileInputRef = useRef(null);
 
   // Rekaman Suara
@@ -102,8 +139,71 @@ export default function App() {
   const [alarmData, setAlarmData] = useState(null);
   const [wakeUpNotice, setWakeUpNotice] = useState(null);
   const [missionCount, setMissionCount] = useState(0);
+  const isAlarmActiveRef = useRef(false);
+  const alarmDataRef = useRef(null);
 
   const socketRef = useRef(null);
+
+  const checkBattery = () => {
+    if (Capacitor.isNativePlatform()) {
+      WakeMateNative.getBatteryStatus()
+        .then(r => setBatteryRestricted(!r?.ignoringBatteryOptimizations))
+        .catch(() => {});
+    }
+  };
+
+  useEffect(() => {
+    checkBattery();
+    const onVis = () => {
+      if (document.visibilityState === 'visible') checkBattery();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, []);
+
+  useEffect(() => {
+    if (!activeAudioId) return;
+    getCachedAudio(activeAudioId).then((cached) => {
+      if (!cached?.dataUrl) return;
+      if (cached.soundType === 'voice') {
+        setVoiceDataUrl(cached.dataUrl);
+        setSelectedSound('voice');
+      } else {
+        setTiktokAudioDataUrl(cached.dataUrl);
+        setTiktokAudioFileName(cached.name || 'Audio Kustom');
+        setSelectedSound('tiktok');
+      }
+    }).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    try { localStorage.setItem('wakemate_role', currentRole); } catch {}
+  }, [currentRole]);
+
+  useEffect(() => {
+    try { localStorage.setItem('wakemate_custom_msg', customMessage); } catch {}
+  }, [customMessage]);
+
+  useEffect(() => {
+    try { localStorage.setItem('wakemate_custom_texts', JSON.stringify(customTexts)); } catch {}
+  }, [customTexts]);
+
+  useEffect(() => {
+    const liteSchedules = scheduledAlarms.map(({ voiceDataUrl: _v, ...rest }) => rest);
+    try {
+      localStorage.setItem(`wakemate_schedules_${roomId}`, JSON.stringify(liteSchedules));
+    } catch {}
+    if (Capacitor.isNativePlatform()) {
+      WakeMateNative.syncConfig({
+        serverUrl,
+        roomId,
+        roomPin,
+        deviceId: DEVICE_ID,
+        role: currentRole,
+        schedulesJson: JSON.stringify(liteSchedules)
+      }).catch(() => {});
+    }
+  }, [serverUrl, roomId, roomPin, currentRole, scheduledAlarms]);
 
   // Scroll otomatis ke atas saat ganti tab agar layout tidak bergeser aneh
   const switchTab = (tabName) => {
@@ -132,8 +232,15 @@ export default function App() {
       setIsConnected(true);
       setAuthError(null);
       const username = currentRole === 'bima' ? 'Bima' : 'Pacar';
-      // AUD-01: Kirim roomId dan PIN terotentikasi
-      socket.emit('join_room', { roomId, username, pin: roomPin, deviceId: DEVICE_ID });
+      // AUD-01: Kirim roomId, PIN, daftar audio lokal, dan jadwal lokal
+      socket.emit('join_room', {
+        roomId,
+        username,
+        pin: roomPin,
+        deviceId: DEVICE_ID,
+        cachedAudioIds: getCachedAudioList().map(a => a.audioId),
+        clientSchedules: loadStoredSchedules(roomId)
+      });
 
       // AUD-06: Jalankan Foreground Service siaga saat terhubung
       if (Capacitor.isNativePlatform()) {
@@ -167,8 +274,55 @@ export default function App() {
       if (data.roomId === roomId) {
         setAuthError(null);
         setScheduledAlarms(data.scheduledAlarms || []);
+        setServerCachedAudioIds(data.cachedAudioIds || []);
+        const roomAudios = Array.isArray(data.customAudios)
+          ? data.customAudios
+          : (Array.isArray(data.cachedAudioIds) ? data.cachedAudioIds.map(audioId => ({ audioId })) : []);
+        roomAudios.forEach(async (item) => {
+          const id = typeof item === 'string' ? item : item?.audioId;
+          const name = typeof item === 'object' ? (item.audioName || item.name) : undefined;
+          if (!id) return;
+          const existing = await getCachedAudio(id);
+          if (!existing) {
+            socket.emit('get_audio', { audioId: id, audioName: name });
+          }
+        });
         if (data.isAlarmActive && data.currentAlarm && data.currentAlarm.senderDeviceId !== DEVICE_ID) {
           triggerLocalAlarm(data.currentAlarm);
+        }
+      }
+    });
+
+    socket.on('audio_uploaded', (data) => {
+      if (data?.audioId) {
+        setServerCachedAudioIds(prev => prev.includes(data.audioId) ? prev : [...prev, data.audioId]);
+        getCachedAudio(data.audioId).then((existing) => {
+          if (!existing) {
+            socket.emit('get_audio', { audioId: data.audioId, audioName: data.audioName });
+          }
+        }).catch(() => {});
+      }
+    });
+
+    socket.on('audio_sync_payload', async (data) => {
+      if (!data?.audioId || !data?.voiceDataUrl) return;
+      const saved = await saveCachedAudio(data.audioId, data.audioName || 'Audio Pasangan', 'tiktok', data.voiceDataUrl);
+      if (saved) {
+        setSavedAudios(getCachedAudioList());
+        setServerCachedAudioIds(prev => prev.includes(data.audioId) ? prev : [...prev, data.audioId]);
+        if (Capacitor.isNativePlatform()) {
+          WakeMateNative.saveNativeAudio({ audioId: data.audioId, dataUrl: saved.dataUrl }).catch(() => {});
+        }
+        socket.emit('client_audio_cached', { audioId: data.audioId });
+      }
+    });
+
+    socket.on('custom_text_received', (data) => {
+      if (currentRole === 'simulasi' || data?.senderDeviceId !== DEVICE_ID) {
+        setReceivedCustomText(data);
+        soundManager.playBeep();
+        if ('vibrate' in navigator) {
+          navigator.vibrate([300, 150, 300]);
         }
       }
     });
@@ -178,6 +332,9 @@ export default function App() {
     });
 
     socket.on('alarm_triggered', (data) => {
+      if (data?.id) {
+        setScheduledAlarms(prev => prev.map(a => (a.id === data.id ? { ...a, fired: true } : a)));
+      }
       // AUD-07: Periksa apakah perangkat fisik ini adalah pengirim alarm murni
       const myName = currentRole === 'bima' ? 'Bima' : 'Pacar';
       const isSender = currentRole !== 'simulasi' && (
@@ -202,13 +359,27 @@ export default function App() {
     return () => {
       socket.disconnect();
       stopPreviewAudio();
-      if (Capacitor.isNativePlatform()) {
-        try {
-          WakeMateNative.stopForegroundService().catch(() => {});
-        } catch (_) {}
-      }
     };
   }, [serverUrl, roomId, roomPin, currentRole]);
+
+  // Pemeriksaan jadwal lokal setiap 1 detik (tetap berdering meskipun HP sedang offline)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const now = Date.now();
+      const due = scheduledAlarms.find(
+        (a) => !a.fired && a.triggerTime <= now && (now - a.triggerTime) < 300000
+      );
+      if (!due) return;
+      setScheduledAlarms(prev => prev.map(a => (a.id === due.id ? { ...a, fired: true } : a)));
+      if (!isAlarmActiveRef.current && (currentRole === 'simulasi' || due.senderDeviceId !== DEVICE_ID)) {
+        triggerLocalAlarm({
+          ...due,
+          sender: due.creator || due.sender || 'Pasangan'
+        });
+      }
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [scheduledAlarms, currentRole]);
 
   // Coba sambung ulang saat jaringan kembali, aplikasi dibuka lagi, atau berkala setiap 5s jika offline
   useEffect(() => {
@@ -253,6 +424,58 @@ export default function App() {
     audio.play().catch(e => console.error("Preview audio error:", e));
   };
 
+  const registerCustomAudio = async (name, soundType, dataUrl) => {
+    const audioId = computeAudioId(dataUrl);
+    if (!audioId) return;
+    await saveCachedAudio(audioId, name, soundType, dataUrl);
+    setSavedAudios(getCachedAudioList());
+    setActiveAudioId(audioId);
+    try { localStorage.setItem('wakemate_active_audio_id', audioId); } catch (_) {}
+    if (Capacitor.isNativePlatform()) {
+      WakeMateNative.saveNativeAudio({ audioId, dataUrl }).catch(() => {});
+    }
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('upload_audio', {
+        audioId,
+        audioName: name,
+        voiceDataUrl: dataUrl
+      });
+    }
+  };
+
+  const handleSelectSavedAudio = async (item) => {
+    stopPreviewAudio();
+    const cached = await getCachedAudio(item.audioId);
+    if (!cached?.dataUrl) return;
+    setActiveAudioId(item.audioId);
+    try { localStorage.setItem('wakemate_active_audio_id', item.audioId); } catch (_) {}
+    if (item.soundType === 'voice') {
+      setVoiceDataUrl(cached.dataUrl);
+      setSelectedSound('voice');
+    } else {
+      setTiktokAudioDataUrl(cached.dataUrl);
+      setTiktokAudioFileName(item.name || 'Audio Kustom');
+      setSelectedSound('tiktok');
+    }
+    if (socketRef.current?.connected && !serverCachedAudioIds.includes(item.audioId)) {
+      socketRef.current.emit('upload_audio', {
+        audioId: item.audioId,
+        audioName: item.name,
+        voiceDataUrl: cached.dataUrl
+      });
+    }
+  };
+
+  const handleDeleteSavedAudio = async (e, audioId) => {
+    e.stopPropagation();
+    await deleteCachedAudio(audioId);
+    setSavedAudios(getCachedAudioList());
+    if (activeAudioId === audioId) {
+      setActiveAudioId(null);
+      try { localStorage.removeItem('wakemate_active_audio_id'); } catch (_) {}
+    }
+  };
+
   // Upload Audio TikTok / MP3
   const handleAudioUpload = (e) => {
     const file = e.target.files?.[0];
@@ -264,22 +487,49 @@ export default function App() {
     }
 
     const reader = new FileReader();
-    reader.onload = (event) => {
-      setTiktokAudioDataUrl(event.target.result);
+    reader.onload = async (event) => {
+      const dataUrl = event.target.result;
+      setTiktokAudioDataUrl(dataUrl);
       setTiktokAudioFileName(file.name);
       setSelectedSound('tiktok');
       stopPreviewAudio();
+      await registerCustomAudio(file.name, 'tiktok', dataUrl);
     };
     reader.readAsDataURL(file);
   };
 
   // Memicu Alarm Aktif di Layar
-  const triggerLocalAlarm = (data) => {
+  const triggerLocalAlarm = async (data) => {
+    if (isAlarmActiveRef.current && data?.id && alarmDataRef.current?.id === data.id) {
+      return;
+    }
+    isAlarmActiveRef.current = true;
+    alarmDataRef.current = data;
     stopPreviewAudio();
     setIsAlarmActive(true);
     setAlarmData(data);
     setMissionCount(0);
     setWakeUpNotice(null);
+
+    let audioUrl = data.voiceDataUrl || null;
+    if (data.voiceDataUrl && data.audioId) {
+      const saved = await saveCachedAudio(
+        data.audioId,
+        data.audioName || 'Audio Pasangan',
+        data.sound === 'voice' ? 'voice' : 'tiktok',
+        data.voiceDataUrl
+      );
+      if (saved) {
+        setSavedAudios(getCachedAudioList());
+        if (Capacitor.isNativePlatform()) {
+          WakeMateNative.saveNativeAudio({ audioId: data.audioId, dataUrl: saved.dataUrl }).catch(() => {});
+        }
+        socketRef.current?.emit('client_audio_cached', { audioId: data.audioId });
+      }
+    } else if (!data.voiceDataUrl && data.audioId) {
+      const cached = await getCachedAudio(data.audioId);
+      audioUrl = cached?.dataUrl || null;
+    }
 
     // AUD-06: Paksa volume perangkat fisik ke tingkat maksimal 100% pada detik alarm berdering
     if (Capacitor.isNativePlatform()) {
@@ -287,14 +537,15 @@ export default function App() {
         WakeMateNative.maximizeVolume().catch(() => {});
         WakeMateNative.showAlarmNotification({
           title: `Alarm dari ${data.sender || 'Pasangan'}`,
-          message: data.message || 'Waktunya bangun!'
+          message: data.message || 'Waktunya bangun!',
+          audioId: data.audioId || ''
         }).catch(() => {});
       } catch (_) {}
     }
 
     const volume = data.volume || 100;
     const soundType = data.sound || 'siren';
-    soundManager.play(soundType, volume, data.voiceDataUrl);
+    soundManager.play(soundType, volume, audioUrl);
 
     if ('vibrate' in navigator) {
       navigator.vibrate([800, 400, 800, 400, 1000]);
@@ -303,6 +554,8 @@ export default function App() {
 
   // Menghentikan Alarm
   const stopLocalAlarm = (stopper) => {
+    isAlarmActiveRef.current = false;
+    alarmDataRef.current = null;
     setIsAlarmActive(false);
     setAlarmData(null);
     setMissionCount(0);
@@ -352,9 +605,12 @@ export default function App() {
         } else {
           const reader = new FileReader();
           reader.readAsDataURL(audioBlob);
-          reader.onloadend = () => {
-            setVoiceDataUrl(reader.result);
+          reader.onloadend = async () => {
+            const dataUrl = reader.result;
+            const recName = `Rekaman ${currentRole === 'bima' ? 'Bima' : 'Pacar'} (${new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })})`;
+            setVoiceDataUrl(dataUrl);
             setSelectedSound('voice');
+            await registerCustomAudio(recName, 'voice', dataUrl);
           };
         }
       };
@@ -392,6 +648,10 @@ export default function App() {
     if (!socketRef.current) return;
     const creatorName = currentRole === 'bima' ? 'Bima' : 'Pacar';
     const targetName = currentRole === 'bima' ? 'Pacar' : 'Bima';
+    const isCustom = selectedSound === 'tiktok' || selectedSound === 'voice';
+    const rawAudio = getActiveAudioPayload();
+    const resolvedAudioId = isCustom ? (activeAudioId || (rawAudio ? computeAudioId(rawAudio) : null)) : null;
+    const audioName = isCustom ? (selectedSound === 'tiktok' ? (tiktokAudioFileName || 'Audio TikTok') : 'Rekaman Suara') : null;
 
     const payload = {
       roomId,
@@ -400,7 +660,11 @@ export default function App() {
       volume: selectedVolume,
       sound: selectedSound,
       message: customMessage || 'BANGUN SEKARANG!',
-      voiceDataUrl: getActiveAudioPayload(),
+      audioId: resolvedAudioId,
+      audioName,
+      voiceDataUrl: isCustom
+        ? (resolvedAudioId && serverCachedAudioIds.includes(resolvedAudioId) ? null : rawAudio)
+        : null,
       missionRequired
     };
 
@@ -409,7 +673,6 @@ export default function App() {
 
   // Jadwalkan Alarm dari Jauh
   const handleScheduleAlarm = () => {
-    if (!socketRef.current) return;
     const creatorName = currentRole === 'bima' ? 'Bima' : 'Pacar';
     const targetName = currentRole === 'bima' ? 'Pacar' : 'Bima';
 
@@ -421,28 +684,72 @@ export default function App() {
       targetDate.setDate(targetDate.getDate() + 1);
     }
 
-    const payload = {
+    const isCustom = selectedSound === 'tiktok' || selectedSound === 'voice';
+    const rawAudio = getActiveAudioPayload();
+    const resolvedAudioId = isCustom ? (activeAudioId || (rawAudio ? computeAudioId(rawAudio) : null)) : null;
+    const audioName = isCustom ? (selectedSound === 'tiktok' ? (tiktokAudioFileName || 'Audio TikTok') : 'Rekaman Suara') : null;
+
+    const newSchedule = {
+      id: Date.now().toString(),
       roomId,
       creator: creatorName,
+      sender: creatorName,
+      senderDeviceId: DEVICE_ID,
       targetName,
       timeString: scheduleTime,
       triggerTime: targetDate.getTime(),
       volume: selectedVolume,
       sound: selectedSound,
       message: customMessage || 'BANGUN SAYANG!',
-      voiceDataUrl: getActiveAudioPayload(),
-      missionRequired
+      audioId: resolvedAudioId,
+      audioName,
+      voiceDataUrl: isCustom
+        ? (resolvedAudioId && serverCachedAudioIds.includes(resolvedAudioId) ? null : rawAudio)
+        : null,
+      missionRequired,
+      fired: false
     };
 
-    socketRef.current.emit('schedule_alarm', payload);
+    setScheduledAlarms(prev => [...prev.filter(a => a.id !== newSchedule.id), newSchedule]);
+    socketRef.current?.emit('schedule_alarm', newSchedule);
     setWakeUpNotice(`⏰ Jadwal jam ${scheduleTime} tersimpan di HP ${targetName}!`);
     setTimeout(() => setWakeUpNotice(null), 4000);
     switchTab('list');
   };
 
   const handleDeleteSchedule = (alarmId) => {
-    if (!socketRef.current) return;
-    socketRef.current.emit('delete_scheduled_alarm', { alarmId });
+    setScheduledAlarms(prev => prev.filter(a => a.id !== alarmId));
+    socketRef.current?.emit('delete_scheduled_alarm', { alarmId });
+  };
+
+  const handleSaveCustomText = () => {
+    const trimmed = customMessage.trim();
+    if (!trimmed) return;
+    if (!customTexts.includes(trimmed)) {
+      setCustomTexts(prev => [trimmed, ...prev].slice(0, 20));
+    }
+    setWakeUpNotice('📌 Teks kustom berhasil disimpan ke daftar cepat!');
+    setTimeout(() => setWakeUpNotice(null), 3000);
+  };
+
+  const handleDeleteCustomText = (e, msg) => {
+    e.stopPropagation();
+    setCustomTexts(prev => prev.filter(item => item !== msg));
+  };
+
+  const targetPartner = currentRole === 'bima' ? 'Pacar' : 'Bima';
+
+  const handleSendCustomText = () => {
+    const text = customMessage.trim();
+    if (!text || !socketRef.current) return;
+    const creatorName = currentRole === 'bima' ? 'Bima' : 'Pacar';
+    socketRef.current.emit('send_custom_text', {
+      roomId,
+      sender: creatorName,
+      message: text
+    });
+    setWakeUpNotice(`💬 Pesan teks terkirim ke layar HP ${targetPartner}!`);
+    setTimeout(() => setWakeUpNotice(null), 4000);
   };
 
   const handleStopAlarm = () => {
@@ -473,21 +780,15 @@ export default function App() {
       return;
     }
 
+    localStorage.setItem('wakemate_room', cleanRoom);
     localStorage.setItem('wakemate_pin', cleanPin);
     setRoomId(cleanRoom);
     setRoomPin(cleanPin);
+    setScheduledAlarms(loadStoredSchedules(cleanRoom));
     setAuthError(null);
     setWakeUpNotice(`🔑 Menyambungkan ke kamar ${cleanRoom} (PIN: ${cleanPin})...`);
     setTimeout(() => setWakeUpNotice(null), 4000);
   };
-
-  // Preset pesan cepat
-  const quickMessages = [
-    'BANGUN SAYANG! ☀️',
-    'ADA KULIAH / KERJA! ⏰',
-    'TELPON AKU SEKARANG! 📞',
-    'JANGAN TIDUR LAGI! 🛑'
-  ];
 
   // Preset jam cepat
   const setQuickTime = (type) => {
@@ -506,6 +807,65 @@ export default function App() {
     setScheduleTime(`${h}:${m}`);
   };
 
+  const renderSavedAudiosBox = () => {
+    if (savedAudios.length === 0) return null;
+    return (
+      <div className="nb-card-sm" style={{ backgroundColor: '#F8FAFC', marginTop: '10px', border: '2px solid #000' }}>
+        <div style={{ fontSize: '0.78rem', fontWeight: 900, marginBottom: '6px' }}>
+          📦 Audio Kustom Tersimpan di HP ({savedAudios.length}):
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '150px', overflowY: 'auto' }}>
+          {savedAudios.map((item) => {
+            const isSelected = (selectedSound === 'tiktok' || selectedSound === 'voice') && activeAudioId === item.audioId;
+            return (
+              <div
+                key={item.audioId}
+                onClick={() => handleSelectSavedAudio(item)}
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  padding: '6px 10px',
+                  borderRadius: '8px',
+                  border: '2px solid #000',
+                  backgroundColor: isSelected ? '#FFE600' : '#FFFFFF',
+                  cursor: 'pointer',
+                  fontSize: '0.78rem',
+                  fontWeight: 800
+                }}
+              >
+                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '75%' }}>
+                  {item.soundType === 'voice' ? '🎙️' : '🎵'} {item.name}
+                  {serverCachedAudioIds.includes(item.audioId) ? ' ⚡' : ''}
+                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  {isSelected && <span style={{ fontSize: '0.7rem', color: '#000' }}>Aktif</span>}
+                  <button
+                    type="button"
+                    onClick={(e) => handleDeleteSavedAudio(e, item.audioId)}
+                    style={{
+                      background: '#FF5757',
+                      color: '#FFF',
+                      border: '1.5px solid #000',
+                      borderRadius: '6px',
+                      padding: '2px 6px',
+                      cursor: 'pointer',
+                      fontWeight: 900,
+                      fontSize: '0.72rem'
+                    }}
+                    title="Hapus dari HP"
+                  >
+                    ×
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
   // Tampilan Layar Darurat Saat Alarm Berdering
   if (isAlarmActive) {
     return (
@@ -515,7 +875,7 @@ export default function App() {
             <AlertTriangle size={16} /> ALARM DARURAT AKTIF
           </div>
           
-          <h1 style={{ fontSize: '1.9rem', fontWeight: 900, lineHeight: 1.2, marginBottom: '10px' }}>
+          <h1 style={{ fontSize: '1.55rem', fontWeight: 900, lineHeight: 1.2, marginBottom: '10px', overflowWrap: 'break-word' }}>
             🚨 {alarmData?.sender?.toUpperCase() || 'PASANGAN'} MEMBANGUNKANMU!
           </h1>
           
@@ -552,8 +912,6 @@ export default function App() {
     );
   }
 
-  const targetPartner = currentRole === 'bima' ? 'Pacar' : 'Bima';
-
   return (
     <div className="app-container">
       
@@ -561,6 +919,26 @@ export default function App() {
       {wakeUpNotice && (
         <div className="nb-card-sm" style={{ backgroundColor: '#48E59B', marginBottom: '14px', textAlign: 'center', fontWeight: 800, fontSize: '0.9rem', border: '2.5px solid #000' }}>
           {wakeUpNotice}
+        </div>
+      )}
+
+      {/* Pop-up Pesan Teks Kustom dari Pasangan */}
+      {receivedCustomText && (
+        <div className="nb-card" style={{ backgroundColor: '#FFE600', border: '3px solid #000', marginBottom: '14px', textAlign: 'center', boxShadow: '5px 5px 0px #000' }}>
+          <div className="nb-badge" style={{ backgroundColor: '#FFFFFF', marginBottom: '8px' }}>
+            💬 PESAN DARI {(receivedCustomText.sender || 'PASANGAN').toUpperCase()}
+          </div>
+          <div style={{ fontSize: '1.25rem', fontWeight: 900, margin: '8px 0 14px', color: '#000' }}>
+            "{receivedCustomText.message}"
+          </div>
+          <button
+            type="button"
+            onClick={() => setReceivedCustomText(null)}
+            className="nb-button nb-button-success"
+            style={{ width: '100%', padding: '10px', fontSize: '0.95rem' }}
+          >
+            👌 Sudah Dibaca
+          </button>
         </div>
       )}
 
@@ -586,6 +964,27 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {/* Banner Penghemat Baterai Adaptif */}
+      {batteryRestricted && (
+        <div className="nb-card-sm" style={{ backgroundColor: '#FFE600', marginBottom: '14px', border: '2.5px solid #000', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          <span style={{ fontWeight: 800, fontSize: '0.82rem', color: '#000' }}>
+            🔋 Agar alarm tetap bunyi saat window dihapus / layar mati, izinkan jalan di background
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              WakeMateNative.requestIgnoreBatteryOptimization()
+                .then(() => setTimeout(checkBattery, 2000))
+                .catch(() => {});
+            }}
+            className="nb-button nb-button-primary"
+            style={{ padding: '8px 12px', fontSize: '0.82rem', width: '100%' }}
+          >
+            Izinkan Sekarang
+          </button>
+        </div>
+      )}
 
       {(!serverUrl || !roomPin) && (
         <div className="nb-card-sm" style={{ backgroundColor: '#FF5757', color: '#FFF', marginBottom: '14px', textAlign: 'center', fontWeight: 800, fontSize: '0.9rem', border: '2.5px solid #000' }}>
@@ -622,27 +1021,53 @@ export default function App() {
             <label style={{ fontWeight: 800, fontSize: '0.9rem', display: 'block', marginBottom: '8px' }}>
               💬 Pesan di Layar HP {targetPartner}:
             </label>
-            <input 
-              type="text" 
-              value={customMessage}
-              onChange={(e) => setCustomMessage(e.target.value)}
-              className="nb-input"
-              placeholder="Contoh: BANGUN SAYANG! UDAH SIANG!"
-              style={{ marginBottom: '10px' }}
-            />
+            <div style={{ display: 'flex', gap: '6px', marginBottom: '10px' }}>
+              <input 
+                type="text" 
+                value={customMessage}
+                onChange={(e) => setCustomMessage(e.target.value)}
+                className="nb-input"
+                placeholder="Contoh: BANGUN SAYANG! UDAH SIANG!"
+                style={{ flex: 1 }}
+              />
+              <button
+                type="button"
+                onClick={handleSaveCustomText}
+                className="nb-button nb-button-primary"
+                style={{ padding: '8px 10px', fontSize: '0.75rem', whiteSpace: 'nowrap' }}
+              >
+                + Simpan Teks
+              </button>
+            </div>
             {/* Quick Chips */}
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
-              {quickMessages.map((msg, idx) => (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '10px' }}>
+              {customTexts.map((msg, idx) => (
                 <button
                   key={idx}
                   type="button"
                   onClick={() => setCustomMessage(msg)}
                   className="nb-chip"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
                 >
-                  {msg}
+                  <span>{msg}</span>
+                  <span
+                    onClick={(e) => handleDeleteCustomText(e, msg)}
+                    style={{ fontWeight: 900, color: '#FF5757', paddingLeft: '2px' }}
+                    title="Hapus teks"
+                  >
+                    ×
+                  </span>
                 </button>
               ))}
             </div>
+            <button
+              type="button"
+              onClick={handleSendCustomText}
+              className="nb-button nb-button-cyan"
+              style={{ width: '100%', padding: '10px', fontSize: '0.85rem' }}
+            >
+              💬 Kirim Teks Saja ke Layar HP {targetPartner}
+            </button>
           </div>
 
           {/* Kartu Pilihan Suara (DENGAN PILIHAN AUDIO TIKTOK / MP3) */}
@@ -786,6 +1211,8 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            {renderSavedAudiosBox()}
           </div>
 
           {/* Kartu Volume & Misi Bangun */}
@@ -845,13 +1272,44 @@ export default function App() {
             <label style={{ fontWeight: 800, fontSize: '0.9rem', display: 'block', marginBottom: '8px' }}>
               💬 Pesan Saat Jam Tiba:
             </label>
-            <input 
-              type="text" 
-              value={customMessage}
-              onChange={(e) => setCustomMessage(e.target.value)}
-              className="nb-input"
-              placeholder="Contoh: BANGUN SAYANG! WAKTUNYA KULIAH!"
-            />
+            <div style={{ display: 'flex', gap: '6px', marginBottom: '10px' }}>
+              <input 
+                type="text" 
+                value={customMessage}
+                onChange={(e) => setCustomMessage(e.target.value)}
+                className="nb-input"
+                placeholder="Contoh: BANGUN SAYANG! WAKTUNYA KULIAH!"
+                style={{ flex: 1 }}
+              />
+              <button
+                type="button"
+                onClick={handleSaveCustomText}
+                className="nb-button nb-button-primary"
+                style={{ padding: '8px 10px', fontSize: '0.75rem', whiteSpace: 'nowrap' }}
+              >
+                + Simpan Teks
+              </button>
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+              {customTexts.map((msg, idx) => (
+                <button
+                  key={idx}
+                  type="button"
+                  onClick={() => setCustomMessage(msg)}
+                  className="nb-chip"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+                >
+                  <span>{msg}</span>
+                  <span
+                    onClick={(e) => handleDeleteCustomText(e, msg)}
+                    style={{ fontWeight: 900, color: '#FF5757', paddingLeft: '2px' }}
+                    title="Hapus teks"
+                  >
+                    ×
+                  </span>
+                </button>
+              ))}
+            </div>
           </div>
 
           {/* Pilihan Suara Jadwal Termasuk Suara TikTok */}
@@ -889,6 +1347,8 @@ export default function App() {
                 <span className="nb-badge" style={{ backgroundColor: '#FFE600' }}>Pilih</span>
               )}
             </div>
+
+            {renderSavedAudiosBox()}
           </div>
 
           {/* Kartu Volume & Misi Bangun untuk Jadwal */}

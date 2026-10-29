@@ -1,3 +1,4 @@
+process.env.NO_PERSIST = '1';
 const assert = require('assert');
 const { io: createClient } = require('socket.io-client');
 const { server, io, rooms } = require('./server');
@@ -148,6 +149,85 @@ async function main() {
   a2.emit('stop_alarm', { stopper: 'A' });
   const stoppedPayload = await stoppedAfterReconnect;
   assert.strictEqual(stoppedPayload.stopper, 'A');
+
+  // Pre-sync audio kustom: upload_audio mengirim audio_sync_payload ke B,
+  // lalu setelah B emit client_audio_cached, trigger_alarm dengan audioId mengirim voiceDataUrl: null
+  const uploadedA2 = once(a2, 'audio_uploaded');
+  const catalogB = once(b, 'audio_catalog_updated');
+  const syncB = once(b, 'audio_sync_payload');
+  a2.emit('upload_audio', { audioName: 'Suara Pagi', voiceDataUrl: AUDIO });
+  const [upRes, catRes, syncRes] = await Promise.all([uploadedA2, catalogB, syncB]);
+  assert.ok(upRes.audioId && upRes.audioId.startsWith('aud_'), 'audioId harus berformat aud_*');
+  assert.strictEqual(syncRes.audioId, upRes.audioId);
+  assert.strictEqual(syncRes.voiceDataUrl, AUDIO);
+  assert.ok(Array.isArray(catRes) && catRes.some(x => x.audioId === upRes.audioId));
+
+  b.emit('client_audio_cached', { audioId: upRes.audioId });
+  await sleep(100);
+
+  const cachedTrigA = once(a2, 'alarm_triggered');
+  const cachedTrigB = once(b, 'alarm_triggered');
+  a2.emit('trigger_alarm', { message: 'Bangun Cepat!', audioId: upRes.audioId, audioName: 'Suara Pagi', voiceDataUrl: null });
+  const [trigA2, trigB2] = await Promise.all([cachedTrigA, cachedTrigB]);
+  assert.strictEqual(trigA2.audioId, upRes.audioId);
+  assert.strictEqual(trigA2.voiceDataUrl, null, 'Pengirim sudah cache audioId, voiceDataUrl harus null');
+  assert.strictEqual(trigB2.audioId, upRes.audioId);
+  assert.strictEqual(trigB2.voiceDataUrl, null, 'Penerima B sudah cache audioId, voiceDataUrl harus null');
+
+  // Uji HTTP /api/poll, /api/audio, dan POST /api/stop
+  const pollRes = await fetch(`${URL}/api/poll?roomId=${ROOM_ID}&pin=${PIN}&deviceId=devB`).then(r => r.json());
+  assert.strictEqual(pollRes.ok, true);
+  assert.strictEqual(pollRes.isAlarmActive, true);
+  assert.strictEqual(pollRes.currentAlarm.audioId, upRes.audioId);
+
+  const audioRes = await fetch(`${URL}/api/audio?roomId=${ROOM_ID}&pin=${PIN}&audioId=${upRes.audioId}`).then(r => r.json());
+  assert.strictEqual(audioRes.ok, true);
+  assert.strictEqual(audioRes.voiceDataUrl, AUDIO);
+
+  const httpStopB = once(b, 'alarm_stopped');
+  const stopRes = await fetch(`${URL}/api/stop?roomId=${ROOM_ID}&pin=${PIN}&stopper=B_HTTP`, { method: 'POST' }).then(r => r.json());
+  assert.strictEqual(stopRes.ok, true);
+  const stopEvent = await httpStopB;
+  assert.strictEqual(stopEvent.stopper, 'B_HTTP');
+  assert.strictEqual(rooms[ROOM_ID].isAlarmActive, false);
+
+  // Uji send_custom_text
+  await sleep(2100);
+  const textOnB = once(b, 'custom_text_received');
+  a2.emit('send_custom_text', { sender: 'A', message: 'Jangan lupa sarapan ya!' });
+  const textPayload = await textOnB;
+  assert.strictEqual(textPayload.message, 'Jangan lupa sarapan ya!');
+  assert.strictEqual(textPayload.senderDeviceId, 'devA');
+  assert.strictEqual(rooms[ROOM_ID].lastCustomText.message, 'Jangan lupa sarapan ya!');
+
+  // Uji clientSchedules merge saat join_room & delete_scheduled_alarm mencegah resurreksi
+  const clientSchId = 'sch_local_999';
+  const mergeState = once(b, 'room_state');
+  b.emit('join_room', {
+    roomId: ROOM_ID,
+    username: 'B',
+    pin: PIN,
+    deviceId: 'devB',
+    clientSchedules: [{ id: clientSchId, timeString: '07:00', triggerTime: Date.now() + 600000, message: 'Dari HP' }]
+  });
+  const mergedRoomState = await mergeState;
+  assert.ok(mergedRoomState.scheduledAlarms.some(s => s.id === clientSchId), 'clientSchedules harus digabung ke jadwal room');
+
+  const afterDelList = once(b, 'scheduled_list_updated');
+  a2.emit('delete_scheduled_alarm', { alarmId: clientSchId });
+  const updatedAfterDel = await afterDelList;
+  assert.strictEqual(updatedAfterDel.some(s => s.id === clientSchId), false, 'Jadwal harus terhapus');
+
+  const rejoinAfterDel = once(b, 'room_state');
+  b.emit('join_room', {
+    roomId: ROOM_ID,
+    username: 'B',
+    pin: PIN,
+    deviceId: 'devB',
+    clientSchedules: [{ id: clientSchId, timeString: '07:00', triggerTime: Date.now() + 600000, message: 'Dari HP' }]
+  });
+  const stateAfterDelRejoin = await rejoinAfterDel;
+  assert.strictEqual(stateAfterDelRejoin.scheduledAlarms.some(s => s.id === clientSchId), false, 'Jadwal yang sudah dihapus tidak boleh hidup lagi saat rejoin');
 
   // Rate limit PIN: 5 percobaan gagal, percobaan ke-6 diblokir
   for (let i = 1; i <= 5; i++) {
