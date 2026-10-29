@@ -44,17 +44,20 @@ import org.json.JSONObject;
  * saat aplikasi di-swipe dari Recent Apps atau layar terkunci dalam Doze Mode.
  */
 public class WakeMateKeeperService extends Service {
+    public static final String ACTION_STOP_ALARM = "com.bima.wakemate.STOP_ALARM";
     private static final String CHANNEL_ID = "wakemate_keeper_channel";
-    private static final String ALARM_CHANNEL_ID = "wakemate_alarm_channel";
+    public static final String ALARM_CHANNEL_ID = "wakemate_alarm_popup_v3";
     private static final String MESSAGE_CHANNEL_ID = "wakemate_message_channel";
     private static final int NOTIFICATION_ID = 1001;
-    private static final int ALARM_NOTIFICATION_ID = 2001;
+    public static final int ALARM_NOTIFICATION_ID = 2001;
     private static final int MESSAGE_NOTIFICATION_ID = 2002;
 
     private static MediaPlayer mediaPlayer;
     private static Vibrator vibrator;
     private static volatile String activeAlarmKey = null;
     private static volatile String lastStoppedAlarmKey = null;
+    private static volatile long activeAlarmStartedAt = 0L;
+    private static volatile long lastStopTimestamp = 0L;
     private static volatile String lastTextId = null;
 
     private PowerManager.WakeLock wakeLock;
@@ -85,7 +88,12 @@ public class WakeMateKeeperService extends Service {
     }
 
     public static synchronized void stopNativeAlarm(Context ctx) {
+        stopNativeAlarm(ctx, false);
+    }
+
+    public static synchronized void stopNativeAlarm(Context ctx, boolean forceServerStop) {
         boolean hadActiveNativeAlarm = (activeAlarmKey != null || mediaPlayer != null);
+        lastStopTimestamp = System.currentTimeMillis();
         stopNativeMediaOnly();
         if (activeAlarmKey != null) {
             lastStoppedAlarmKey = activeAlarmKey;
@@ -96,7 +104,7 @@ public class WakeMateKeeperService extends Service {
             if (manager != null) {
                 manager.cancel(ALARM_NOTIFICATION_ID);
             }
-            if (!hadActiveNativeAlarm) return;
+            if (!hadActiveNativeAlarm && !forceServerStop) return;
             final Context appCtx = ctx.getApplicationContext();
             new Thread(() -> {
                 try {
@@ -107,9 +115,10 @@ public class WakeMateKeeperService extends Service {
                     String role = prefs.getString("role", "Pasangan");
                     if (serverUrl.isEmpty() || roomId.isEmpty() || roomPin.isEmpty()) return;
 
+                    String stopperName = "bima".equalsIgnoreCase(role) ? "Bima" : ("pacar".equalsIgnoreCase(role) ? "Pacar" : role);
                     String urlStr = serverUrl + "/api/stop?roomId=" + URLEncoder.encode(roomId, "UTF-8")
                             + "&pin=" + URLEncoder.encode(roomPin, "UTF-8")
-                            + "&stopper=" + URLEncoder.encode(role.isEmpty() ? "Pasangan" : role, "UTF-8");
+                            + "&stopper=" + URLEncoder.encode(stopperName.isEmpty() ? "Pasangan" : stopperName, "UTF-8");
                     HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
                     conn.setRequestMethod("POST");
                     conn.setConnectTimeout(4000);
@@ -119,6 +128,144 @@ public class WakeMateKeeperService extends Service {
                 } catch (Exception ignored) {
                 }
             }).start();
+        }
+    }
+
+    public static void ensureAlarmChannel(NotificationManager manager) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && manager != null) {
+            NotificationChannel alarmChannel = new NotificationChannel(
+                    ALARM_CHANNEL_ID,
+                    "WakeMate Alarm Darurat",
+                    NotificationManager.IMPORTANCE_HIGH
+            );
+            alarmChannel.setDescription("Pop-up alarm darurat dengan tombol Aku Udah Bangun Sayang");
+            alarmChannel.setSound(null, null);
+            alarmChannel.enableVibration(true);
+            alarmChannel.setVibrationPattern(new long[] { 0, 500, 250, 500 });
+            alarmChannel.setBypassDnd(true);
+            alarmChannel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+            manager.createNotificationChannel(alarmChannel);
+        }
+    }
+
+    public static void postAlarmPopupNotification(Context ctx, String title, String message) {
+        try {
+            NotificationManager manager = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (manager == null) return;
+            ensureAlarmChannel(manager);
+
+            Intent activityIntent = new Intent(ctx, MainActivity.class);
+            activityIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            PendingIntent pendingIntent = PendingIntent.getActivity(
+                    ctx,
+                    0,
+                    activityIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+            );
+
+            Intent stopIntent = new Intent(ctx, WakeMateBootReceiver.class)
+                    .setAction(ACTION_STOP_ALARM);
+            PendingIntent stopPendingIntent = PendingIntent.getBroadcast(
+                    ctx,
+                    2001,
+                    stopIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+            );
+
+            NotificationCompat.Builder builder = new NotificationCompat.Builder(ctx, ALARM_CHANNEL_ID)
+                    .setContentTitle(title)
+                    .setContentText(message)
+                    .setStyle(new NotificationCompat.BigTextStyle().bigText(message))
+                    .setSmallIcon(R.mipmap.ic_launcher)
+                    .setPriority(NotificationCompat.PRIORITY_MAX)
+                    .setCategory(NotificationCompat.CATEGORY_ALARM)
+                    .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                    .setDefaults(NotificationCompat.DEFAULT_VIBRATE | NotificationCompat.DEFAULT_LIGHTS)
+                    .setFullScreenIntent(pendingIntent, true)
+                    .setContentIntent(pendingIntent)
+                    .setOngoing(true)
+                    .setAutoCancel(false)
+                    .addAction(android.R.drawable.ic_lock_idle_alarm, "✅ Aku Udah Bangun Sayang", stopPendingIntent);
+
+            manager.notify(ALARM_NOTIFICATION_ID, builder.build());
+        } catch (Exception ignored) {
+        }
+    }
+
+    public static synchronized void startNativeMedia(Context ctx, String sound, String audioId) {
+        stopNativeMediaOnly();
+        try {
+            mediaPlayer = new MediaPlayer();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                mediaPlayer.setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_ALARM)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build());
+            } else {
+                mediaPlayer.setAudioStreamType(AudioManager.STREAM_ALARM);
+            }
+
+            boolean customLoaded = false;
+            if (("tiktok".equals(sound) || "voice".equals(sound)) && audioId != null && !audioId.isEmpty()) {
+                String safeId = audioId.replaceAll("[^a-zA-Z0-9._-]", "_");
+                File customFile = new File(ctx.getFilesDir(), "audio_" + safeId + ".mp3");
+                if (customFile.exists() && customFile.length() > 0) {
+                    try {
+                        mediaPlayer.setDataSource(customFile.getAbsolutePath());
+                        customLoaded = true;
+                    } catch (Exception e) {
+                        mediaPlayer.reset();
+                    }
+                }
+            }
+
+            if (!customLoaded) {
+                File wavFile = new File(ctx.getCacheDir(), "native_siren.wav");
+                if (!wavFile.exists() || wavFile.length() == 0) {
+                    writeSirenWav(wavFile);
+                }
+                mediaPlayer.setDataSource(wavFile.getAbsolutePath());
+            }
+
+            mediaPlayer.setLooping(true);
+            mediaPlayer.prepare();
+            mediaPlayer.start();
+        } catch (Exception ignored) {
+        }
+
+        try {
+            vibrator = (Vibrator) ctx.getSystemService(Context.VIBRATOR_SERVICE);
+            if (vibrator != null && vibrator.hasVibrator()) {
+                long[] pattern = new long[] { 0, 800, 400, 800, 400, 1000 };
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0));
+                } else {
+                    vibrator.vibrate(pattern, 0);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    public static synchronized void showOrTriggerFromPlugin(
+            Context ctx,
+            String key,
+            String title,
+            String message,
+            String sound,
+            String audioId
+    ) {
+        if (key != null && !key.isEmpty()) {
+            activeAlarmKey = key;
+            activeAlarmStartedAt = System.currentTimeMillis();
+        }
+        postAlarmPopupNotification(ctx, title, message);
+        if (MainActivity.isActivityVisible) {
+            stopNativeMediaOnly();
+        } else {
+            startNativeMedia(ctx, sound, audioId);
         }
     }
 
@@ -170,10 +317,12 @@ public class WakeMateKeeperService extends Service {
 
     private void checkLocalSchedules(SharedPreferences prefs, String schedulesJson, String deviceId, String role) {
         if (schedulesJson == null || schedulesJson.isEmpty()) return;
+        if (System.currentTimeMillis() - lastStopTimestamp < 5000L) return;
         try {
             JSONArray arr = new JSONArray(schedulesJson);
             long now = System.currentTimeMillis();
             boolean modified = false;
+            String myName = "bima".equalsIgnoreCase(role) ? "Bima" : "Pacar";
 
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject item = arr.optJSONObject(i);
@@ -182,14 +331,18 @@ public class WakeMateKeeperService extends Service {
                 long triggerTime = item.optLong("triggerTime", 0L);
                 if (!fired && triggerTime > 0 && now >= triggerTime && (now - triggerTime) < 300_000L) {
                     String senderDev = item.optString("senderDeviceId", "");
-                    if ("simulasi".equals(role) || senderDev.isEmpty() || !senderDev.equals(deviceId)) {
-                        item.put("fired", true);
-                        modified = true;
+                    String target = item.optString("target", item.optString("targetName", ""));
+                    boolean isSender = !"simulasi".equalsIgnoreCase(role)
+                            && !deviceId.isEmpty()
+                            && deviceId.equals(senderDev)
+                            && !myName.equalsIgnoreCase(target);
+                    item.put("fired", true);
+                    modified = true;
 
-                        String id = item.optString("id", String.valueOf(triggerTime));
-                        String key = "sched_" + id;
+                    if (!isSender) {
+                        String key = item.optString("id", String.valueOf(triggerTime));
                         if (!key.equals(activeAlarmKey) && !key.equals(lastStoppedAlarmKey)) {
-                            String sender = item.optString("creator", "Pasangan");
+                            String sender = item.optString("creator", item.optString("sender", "Pasangan"));
                             String message = item.optString("message", "Waktunya bangun!");
                             String sound = item.optString("sound", "siren");
                             String audioId = item.optString("audioId", "");
@@ -274,13 +427,19 @@ public class WakeMateKeeperService extends Service {
 
             // 4. Cek status alarm aktif dari server
             boolean isAlarmActive = resp.optBoolean("isAlarmActive", false);
+            long lastStoppedAt = resp.optLong("lastStoppedAt", 0L);
             JSONObject cur = resp.optJSONObject("currentAlarm");
-            if (isAlarmActive && cur != null) {
+            if (isAlarmActive && cur != null && (System.currentTimeMillis() - lastStopTimestamp >= 5000L)) {
                 String senderDev = cur.optString("senderDeviceId", "");
-                boolean isMe = !"simulasi".equals(role) && !deviceId.isEmpty() && deviceId.equals(senderDev);
-                String key = String.valueOf(cur.optLong("timestamp", cur.optLong("firedAt", 1L)));
+                String target = cur.optString("target", cur.optString("targetName", ""));
+                String myName = "bima".equalsIgnoreCase(role) ? "Bima" : "Pacar";
+                boolean isMe = !"simulasi".equalsIgnoreCase(role)
+                        && !deviceId.isEmpty()
+                        && deviceId.equals(senderDev)
+                        && !myName.equalsIgnoreCase(target);
+                String key = cur.optString("id", String.valueOf(cur.optLong("timestamp", cur.optLong("firedAt", 1L))));
                 if (!isMe && !key.equals(activeAlarmKey) && !key.equals(lastStoppedAlarmKey)) {
-                    String sender = cur.optString("sender", "Pasangan");
+                    String sender = cur.optString("sender", cur.optString("creator", "Pasangan"));
                     String message = cur.optString("message", "Waktunya bangun!");
                     String sound = cur.optString("sound", "siren");
                     String audioId = cur.optString("audioId", "");
@@ -289,12 +448,15 @@ public class WakeMateKeeperService extends Service {
                     }
                     triggerNativeAlarm(key, sender, message, sound, audioId);
                 }
-            } else if (!isAlarmActive && activeAlarmKey != null && !activeAlarmKey.startsWith("sched_")) {
-                stopNativeMediaOnly();
-                activeAlarmKey = null;
-                NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-                if (manager != null) {
-                    manager.cancel(ALARM_NOTIFICATION_ID);
+            } else if (!isAlarmActive && activeAlarmKey != null) {
+                long elapsed = System.currentTimeMillis() - activeAlarmStartedAt;
+                if (lastStoppedAt >= activeAlarmStartedAt || elapsed > 15_000L) {
+                    stopNativeMediaOnly();
+                    activeAlarmKey = null;
+                    NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                    if (manager != null) {
+                        manager.cancel(ALARM_NOTIFICATION_ID);
+                    }
                 }
             }
         } catch (Exception ignored) {
@@ -387,6 +549,7 @@ public class WakeMateKeeperService extends Service {
 
     private synchronized void triggerNativeAlarm(String key, String sender, String message, String sound, String audioId) {
         activeAlarmKey = key;
+        activeAlarmStartedAt = System.currentTimeMillis();
 
         // 1. Maksimalkan volume STREAM_ALARM & STREAM_MUSIC
         try {
@@ -400,103 +563,27 @@ public class WakeMateKeeperService extends Service {
         } catch (Exception ignored) {
         }
 
-        // 2. Tampilkan notifikasi layar penuh (FullScreenIntent)
-        Intent activityIntent = new Intent(this, MainActivity.class);
-        activityIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                | Intent.FLAG_ACTIVITY_CLEAR_TOP
-                | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        // 2. Tampilkan notifikasi pop-up di depan layar dengan tombol "Aku Udah Bangun Sayang"
+        postAlarmPopupNotification(this, "🚨 Alarm dari " + sender, message);
 
-        try {
-            NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-            if (manager != null) {
-                PendingIntent pendingIntent = PendingIntent.getActivity(
-                        this,
-                        0,
-                        activityIntent,
-                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-                );
-
-                NotificationCompat.Builder builder = new NotificationCompat.Builder(this, ALARM_CHANNEL_ID)
-                        .setContentTitle("🚨 Alarm dari " + sender)
-                        .setContentText(message)
-                        .setSmallIcon(R.mipmap.ic_launcher)
-                        .setPriority(NotificationCompat.PRIORITY_MAX)
-                        .setCategory(NotificationCompat.CATEGORY_ALARM)
-                        .setFullScreenIntent(pendingIntent, true)
-                        .setContentIntent(pendingIntent)
-                        .setOngoing(true)
-                        .setAutoCancel(false)
-                        .setSilent(true);
-
-                manager.notify(ALARM_NOTIFICATION_ID, builder.build());
-            }
-        } catch (Exception ignored) {
-        }
-
-        // 3. Jika Activity sedang tertutup/di-swipe, bunyikan MediaPlayer native + Vibrator dan angkat Activity
+        // 3. Jika Activity sedang tertutup/di-swipe, bunyikan MediaPlayer native + Vibrator
         if (!MainActivity.isActivityVisible) {
             try {
-                startActivity(activityIntent);
-            } catch (Exception ignored) {
-            }
-
-            stopNativeMediaOnly();
-
-            try {
-                mediaPlayer = new MediaPlayer();
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    mediaPlayer.setAudioAttributes(new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_ALARM)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .build());
-                } else {
-                    mediaPlayer.setAudioStreamType(AudioManager.STREAM_ALARM);
-                }
-
-                boolean customLoaded = false;
-                if (("tiktok".equals(sound) || "voice".equals(sound)) && audioId != null && !audioId.isEmpty()) {
-                    String safeId = audioId.replaceAll("[^a-zA-Z0-9._-]", "_");
-                    File customFile = new File(getFilesDir(), "audio_" + safeId + ".mp3");
-                    if (customFile.exists() && customFile.length() > 0) {
-                        try {
-                            mediaPlayer.setDataSource(customFile.getAbsolutePath());
-                            customLoaded = true;
-                        } catch (Exception e) {
-                            mediaPlayer.reset();
-                        }
-                    }
-                }
-
-                if (!customLoaded) {
-                    File wavFile = new File(getCacheDir(), "native_siren.wav");
-                    if (!wavFile.exists() || wavFile.length() == 0) {
-                        writeSirenWav(wavFile);
-                    }
-                    mediaPlayer.setDataSource(wavFile.getAbsolutePath());
-                }
-
-                mediaPlayer.setLooping(true);
-                mediaPlayer.prepare();
-                mediaPlayer.start();
-            } catch (Exception ignored) {
-            }
-
-            try {
-                vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
-                if (vibrator != null && vibrator.hasVibrator()) {
-                    long[] pattern = new long[] { 0, 800, 400, 800, 400, 1000 };
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        vibrator.vibrate(VibrationEffect.createWaveform(pattern, 0));
-                    } else {
-                        vibrator.vibrate(pattern, 0);
-                    }
+                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                if (pm != null && !pm.isInteractive()) {
+                    Intent activityIntent = new Intent(this, MainActivity.class);
+                    activityIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                            | Intent.FLAG_ACTIVITY_CLEAR_TOP
+                            | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                    startActivity(activityIntent);
                 }
             } catch (Exception ignored) {
             }
+            startNativeMedia(this, sound, audioId);
         }
     }
 
-    private void writeSirenWav(File wavFile) throws Exception {
+    private static void writeSirenWav(File wavFile) throws Exception {
         int sampleRate = 22050;
         int numSamples = sampleRate * 2;
         int dataSize = numSamples * 2;
@@ -592,14 +679,7 @@ public class WakeMateKeeperService extends Service {
             keeperChannel.setDescription("Menjaga koneksi alarm jarak jauh tetap aktif saat HP tidur");
             manager.createNotificationChannel(keeperChannel);
 
-            NotificationChannel alarmChannel = new NotificationChannel(
-                    ALARM_CHANNEL_ID,
-                    "WakeMate Alarm",
-                    NotificationManager.IMPORTANCE_HIGH
-            );
-            alarmChannel.setSound(null, null);
-            alarmChannel.enableVibration(false);
-            manager.createNotificationChannel(alarmChannel);
+            ensureAlarmChannel(manager);
 
             NotificationChannel messageChannel = new NotificationChannel(
                     MESSAGE_CHANNEL_ID,

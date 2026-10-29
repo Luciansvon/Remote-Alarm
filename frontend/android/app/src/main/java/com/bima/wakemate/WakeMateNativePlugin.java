@@ -28,8 +28,26 @@ import java.io.FileOutputStream;
 @CapacitorPlugin(name = "WakeMateNative")
 public class WakeMateNativePlugin extends Plugin {
     public static final String PREFS_NAME = "wakemate_native";
-    private static final String ALARM_CHANNEL_ID = "wakemate_alarm_channel";
     private static final int ALARM_NOTIFICATION_ID = 2001;
+    private static volatile WakeMateNativePlugin activeInstance = null;
+
+    @Override
+    public void load() {
+        super.load();
+        activeInstance = this;
+    }
+
+    public static void notifyAlarmStoppedFromNative() {
+        WakeMateNativePlugin inst = activeInstance;
+        if (inst != null) {
+            try {
+                JSObject payload = new JSObject();
+                payload.put("stopped", true);
+                inst.notifyListeners("nativeAlarmStopped", payload);
+            } catch (Exception ignored) {
+            }
+        }
+    }
 
     @PluginMethod
     public void syncConfig(PluginCall call) {
@@ -136,56 +154,15 @@ public class WakeMateNativePlugin extends Plugin {
 
     @PluginMethod
     public void showAlarmNotification(PluginCall call) {
-        String title = call.getString("title", "Wake-Mate");
-        String message = call.getString("message", "Alarm aktif");
+        String id = call.getString("id", "");
+        String title = call.getString("title", "🚨 Wake-Mate Alarm");
+        String message = call.getString("message", "Waktunya bangun!");
+        String sound = call.getString("sound", "siren");
+        String audioId = call.getString("audioId", "");
         Context context = getContext();
 
-        if (MainActivity.isActivityVisible) {
-            WakeMateKeeperService.stopNativeMediaOnly();
-        }
-
         try {
-            NotificationManager manager = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
-            if (manager == null) {
-                call.reject("NotificationManager tidak tersedia");
-                return;
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                NotificationChannel channel = new NotificationChannel(
-                        ALARM_CHANNEL_ID,
-                        "WakeMate Alarm",
-                        NotificationManager.IMPORTANCE_HIGH
-                );
-                channel.setSound(null, null);
-                channel.enableVibration(false);
-                manager.createNotificationChannel(channel);
-            }
-
-            Intent intent = new Intent(context, MainActivity.class);
-            intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                    | Intent.FLAG_ACTIVITY_CLEAR_TOP
-                    | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-            PendingIntent pendingIntent = PendingIntent.getActivity(
-                    context,
-                    0,
-                    intent,
-                    PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-            );
-
-            NotificationCompat.Builder builder = new NotificationCompat.Builder(context, ALARM_CHANNEL_ID)
-                    .setContentTitle(title)
-                    .setContentText(message)
-                    .setSmallIcon(R.mipmap.ic_launcher)
-                    .setPriority(NotificationCompat.PRIORITY_MAX)
-                    .setCategory(NotificationCompat.CATEGORY_ALARM)
-                    .setFullScreenIntent(pendingIntent, true)
-                    .setContentIntent(pendingIntent)
-                    .setOngoing(true)
-                    .setAutoCancel(false)
-                    .setSilent(true);
-
-            manager.notify(ALARM_NOTIFICATION_ID, builder.build());
+            WakeMateKeeperService.showOrTriggerFromPlugin(context, id, title, message, sound, audioId);
             call.resolve();
         } catch (SecurityException e) {
             call.reject("Izin notifikasi ditolak: " + e.getMessage());

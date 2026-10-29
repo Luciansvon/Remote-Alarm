@@ -112,8 +112,11 @@ export default function App() {
   const [receivedCustomText, setReceivedCustomText] = useState(null);
   const [missionRequired, setMissionRequired] = useState(true); // Wajib ketuk 3x
 
-  // Jadwal Jam & Menit
-  const [scheduleTime, setScheduleTime] = useState('06:30');
+  // Jadwal Jam & Menit (default +1 menit dari sekarang agar mudah dites langsung)
+  const [scheduleTime, setScheduleTime] = useState(() => {
+    const d = new Date(Date.now() + 60000);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  });
 
   // Suara Kustom TikTok / Berkas Audio Sendiri & Cache Lokal
   const [tiktokAudioDataUrl, setTiktokAudioDataUrl] = useState(null);
@@ -158,8 +161,23 @@ export default function App() {
       if (document.visibilityState === 'visible') checkBattery();
     };
     document.addEventListener('visibilitychange', onVis);
-    return () => document.removeEventListener('visibilitychange', onVis);
-  }, []);
+    let subPromise = null;
+    if (Capacitor.isNativePlatform() && typeof WakeMateNative.addListener === 'function') {
+      subPromise = WakeMateNative.addListener('nativeAlarmStopped', () => {
+        const stopper = currentRole === 'bima' ? 'Bima' : 'Pacar';
+        stopLocalAlarm(stopper);
+        if (socketRef.current) {
+          socketRef.current.emit('stop_alarm', { roomId, stopper });
+        }
+      }).catch(() => null);
+    }
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      if (subPromise) {
+        subPromise.then(sub => sub?.remove?.()).catch(() => {});
+      }
+    };
+  }, [currentRole, roomId]);
 
   useEffect(() => {
     if (!activeAudioId) return;
@@ -287,8 +305,15 @@ export default function App() {
             socket.emit('get_audio', { audioId: id, audioName: name });
           }
         });
-        if (data.isAlarmActive && data.currentAlarm && data.currentAlarm.senderDeviceId !== DEVICE_ID) {
-          triggerLocalAlarm(data.currentAlarm);
+        if (data.isAlarmActive && data.currentAlarm) {
+          const myName = currentRole === 'bima' ? 'Bima' : 'Pacar';
+          const targetName = data.currentAlarm.target || data.currentAlarm.targetName || '';
+          const isSender = currentRole !== 'simulasi' &&
+            data.currentAlarm.senderDeviceId === DEVICE_ID &&
+            myName !== targetName;
+          if (!isSender) {
+            triggerLocalAlarm(data.currentAlarm);
+          }
         }
       }
     });
@@ -337,9 +362,11 @@ export default function App() {
       }
       // AUD-07: Periksa apakah perangkat fisik ini adalah pengirim alarm murni
       const myName = currentRole === 'bima' ? 'Bima' : 'Pacar';
-      const isSender = currentRole !== 'simulasi' && (
-        data?.senderDeviceId ? data.senderDeviceId === DEVICE_ID : data?.senderSocketId ? data.senderSocketId === socket.id : (data?.target && data.target !== myName)
-      );
+      const targetName = data?.target || data?.targetName || '';
+      const isSameDevice = data?.senderDeviceId
+        ? data.senderDeviceId === DEVICE_ID
+        : Boolean(data?.senderSocketId && data.senderSocketId === socket.id);
+      const isSender = currentRole !== 'simulasi' && isSameDevice && myName !== targetName;
 
       if (isSender) {
         // Jika saya yang mengirim alarm, jangan bunyikan HP saya dan jangan kunci layar saya!
@@ -377,7 +404,12 @@ export default function App() {
       );
       if (!due) return;
       setScheduledAlarms(prev => prev.map(a => (a.id === due.id ? { ...a, fired: true } : a)));
-      if (!isAlarmActiveRef.current && (currentRole === 'simulasi' || due.senderDeviceId !== DEVICE_ID)) {
+      const myName = currentRole === 'bima' ? 'Bima' : 'Pacar';
+      const targetName = due.target || due.targetName || '';
+      const isSender = currentRole !== 'simulasi' &&
+        Boolean(due.senderDeviceId && due.senderDeviceId === DEVICE_ID) &&
+        myName !== targetName;
+      if (!isSender) {
         triggerLocalAlarm({
           ...due,
           sender: due.creator || due.sender || 'Pasangan'
@@ -537,21 +569,26 @@ export default function App() {
       audioUrl = cached?.dataUrl || null;
     }
 
-    // AUD-06: Paksa volume perangkat fisik ke tingkat maksimal 100% pada detik alarm berdering
+    const volume = data.volume || 100;
+    const soundType = data.sound || 'siren';
+
+    // AUD-06: Paksa volume perangkat fisik ke tingkat maksimal 100% & tampilkan pop-up notifikasi dengan tombol "Aku Udah Bangun Sayang"
     if (Capacitor.isNativePlatform()) {
       try {
         WakeMateNative.maximizeVolume().catch(() => {});
         WakeMateNative.showAlarmNotification({
-          title: `Alarm dari ${data.sender || 'Pasangan'}`,
+          id: String(data.id || data.timestamp || Date.now()),
+          title: `🚨 Alarm dari ${data.sender || 'Pasangan'}`,
           message: data.message || 'Waktunya bangun!',
+          sound: soundType,
           audioId: data.audioId || ''
         }).catch(() => {});
       } catch (_) {}
     }
 
-    const volume = data.volume || 100;
-    const soundType = data.sound || 'siren';
-    soundManager.play(soundType, volume, audioUrl);
+    if (!(Capacitor.isNativePlatform() && document.hidden)) {
+      soundManager.play(soundType, volume, audioUrl);
+    }
 
     if ('vibrate' in navigator) {
       navigator.vibrate([800, 400, 800, 400, 1000]);
@@ -686,27 +723,37 @@ export default function App() {
     const targetName = currentRole === 'bima' ? 'Pacar' : 'Bima';
 
     const [hours, minutes] = scheduleTime.split(':').map(Number);
+    const now = new Date();
     const targetDate = new Date();
     targetDate.setHours(hours, minutes, 0, 0);
 
-    if (targetDate.getTime() <= Date.now()) {
-      targetDate.setDate(targetDate.getDate() + 1);
+    if (targetDate.getTime() <= now.getTime()) {
+      if (hours === now.getHours() && minutes === now.getMinutes()) {
+        // Jika memilih jam:menit yang sama dengan menit sekarang, bunyikan 5 detik lagi (bukan besok!)
+        targetDate.setTime(now.getTime() + 5000);
+      } else {
+        targetDate.setDate(targetDate.getDate() + 1);
+      }
     }
 
+    const delayMs = Math.max(1000, targetDate.getTime() - Date.now());
     const isCustom = selectedSound === 'tiktok' || selectedSound === 'voice';
     const rawAudio = getActiveAudioPayload();
     const resolvedAudioId = isCustom ? (activeAudioId || (rawAudio ? computeAudioId(rawAudio) : null)) : null;
     const audioName = isCustom ? (selectedSound === 'tiktok' ? (tiktokAudioFileName || 'Audio TikTok') : 'Rekaman Suara') : null;
 
     const newSchedule = {
-      id: Date.now().toString(),
+      id: 'sch_' + Date.now(),
       roomId,
       creator: creatorName,
       sender: creatorName,
       senderDeviceId: DEVICE_ID,
+      target: targetName,
       targetName,
+      time: scheduleTime,
       timeString: scheduleTime,
       triggerTime: targetDate.getTime(),
+      delayMs,
       volume: selectedVolume,
       sound: selectedSound,
       message: customMessage || 'BANGUN SAYANG!',
@@ -721,8 +768,10 @@ export default function App() {
 
     setScheduledAlarms(prev => [...prev.filter(a => a.id !== newSchedule.id), newSchedule]);
     socketRef.current?.emit('schedule_alarm', newSchedule);
-    setWakeUpNotice(`⏰ Jadwal jam ${scheduleTime} tersimpan di HP ${targetName}!`);
-    setTimeout(() => setWakeUpNotice(null), 4000);
+    const diffSec = Math.max(1, Math.round(delayMs / 1000));
+    const diffLabel = diffSec < 60 ? `${diffSec} detik lagi` : `${Math.round(diffSec / 60)} menit lagi`;
+    setWakeUpNotice(`⏰ Jadwal jam ${scheduleTime} (${diffLabel}) tersimpan untuk HP ${targetName}!`);
+    setTimeout(() => setWakeUpNotice(null), 5000);
     switchTab('list');
   };
 
@@ -802,7 +851,11 @@ export default function App() {
   // Preset jam cepat
   const setQuickTime = (type) => {
     const now = new Date();
-    if (type === 'plus15') {
+    if (type === 'plus1') {
+      now.setMinutes(now.getMinutes() + 1);
+    } else if (type === 'plus5') {
+      now.setMinutes(now.getMinutes() + 5);
+    } else if (type === 'plus15') {
       now.setMinutes(now.getMinutes() + 15);
     } else if (type === 'plus30') {
       now.setMinutes(now.getMinutes() + 30);
@@ -1265,6 +1318,8 @@ export default function App() {
 
             {/* Quick Time Chips */}
             <div style={{ display: 'flex', justifyContent: 'center', flexWrap: 'wrap', gap: '6px' }}>
+              <button type="button" onClick={() => setQuickTime('plus1')} className="nb-chip">+1 Mnt</button>
+              <button type="button" onClick={() => setQuickTime('plus5')} className="nb-chip">+5 Mnt</button>
               <button type="button" onClick={() => setQuickTime('plus15')} className="nb-chip">+15 Mnt</button>
               <button type="button" onClick={() => setQuickTime('plus30')} className="nb-chip">+30 Mnt</button>
               <button type="button" onClick={() => setQuickTime('0600')} className="nb-chip">06:00 Pagi</button>

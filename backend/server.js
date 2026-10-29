@@ -127,6 +127,7 @@ const server = http.createServer((req, res) => {
       serverTime: Date.now(),
       isAlarmActive: room.isAlarmActive,
       currentAlarm: room.currentAlarm,
+      lastStoppedAt: room.lastStoppedAt || 0,
       lastCustomText: room.lastCustomText || null,
       scheduledAlarms: publicAlarms(room.scheduledAlarms),
       customAudios: room.customAudios || []
@@ -161,11 +162,12 @@ const server = http.createServer((req, res) => {
       sendJson(res, 403, { ok: false, error: 'PIN salah' });
       return;
     }
+    room.lastStoppedAt = Date.now();
     if (room.isAlarmActive) {
       room.isAlarmActive = false;
       room.currentAlarm = null;
       room.lastActivityAt = Date.now();
-      io.to(roomId).emit('alarm_stopped', { stopper, timestamp: Date.now() });
+      io.to(roomId).emit('alarm_stopped', { stopper, timestamp: room.lastStoppedAt });
       saveRooms(true);
     }
     sendJson(res, 200, { ok: true });
@@ -419,11 +421,11 @@ const maintenanceInterval = setInterval(() => {
           alarm.firedAt = now;
           room.isAlarmActive = true;
           // Set currentAlarm tanpa voiceDataUrl agar tidak membebani memori server
-          room.currentAlarm = { ...alarm, voiceDataUrl: null };
+          room.currentAlarm = { ...alarm, timestamp: now, voiceDataUrl: null };
 
           const alarmTitle = alarm.message || alarm.sound || 'Alarm Terjadwal';
           console.log(`[JADWAL TIBA] Alarm '${alarmTitle}' di Room ${roomId} berdering sekarang!`);
-          emitAlarmToRoom(roomId, alarm);
+          emitAlarmToRoom(roomId, { ...alarm, timestamp: now });
 
           // Hapus Base64 dari riwayat setelah berdering agar memori RAM tidak bengkak
           alarm.voiceDataUrl = null;
@@ -722,12 +724,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // AUD-03: Rate limiting per socket (min 2000 ms)
-    if (isRateLimited(socket, 2000)) {
-      socket.emit('rate_limit_error', { message: 'Harap tunggu 2 detik sebelum mengirim perintah lagi.' });
-      return;
-    }
-
     // AUD-02: Batas maksimal kuota jadwal aktif yang belum berbunyi
     const activeSchedulesCount = (rooms[roomId].scheduledAlarms || []).filter(a => !a.fired).length;
     if (activeSchedulesCount >= MAX_SCHEDULED_PER_ROOM) {
@@ -752,16 +748,25 @@ io.on('connection', (socket) => {
       socket.data.cachedAudioIds?.add(audioId);
     }
 
+    const customId = typeof data.id === 'string' && data.id.trim()
+      ? data.id.trim().slice(0, 64)
+      : ('sch_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6));
+    const timeStr = String(data.timeString || data.time || '06:30').trim().slice(0, 10) || '06:30';
+    const resolvedTriggerTime = typeof data.delayMs === 'number' && data.delayMs > 0
+      ? Date.now() + data.delayMs
+      : (Number(data.triggerTime) || Date.now());
+
     const newAlarm = {
-      id: 'sch_' + Date.now(),
+      id: customId,
       creatorSocketId: socket.id,
       senderDeviceId: socket.data.deviceId, // Identitas perangkat dari sesi join
       creator: data.creator || socket.data?.username || 'Bima',
       sender: data.creator || socket.data?.username || 'Bima',
       target: data.target || data.targetName || 'Pacar',
       targetName: data.target || data.targetName || 'Pacar',
-      timeString: data.timeString || '06:30', // Format "HH:mm" misal "06:30"
-      triggerTime: Number(data.triggerTime) || Date.now(), // Epoch millisecond
+      timeString: timeStr, // Format "HH:mm" misal "06:30"
+      time: timeStr,
+      triggerTime: resolvedTriggerTime, // Epoch millisecond
       volume: typeof data.volume === 'number' ? data.volume : 100,
       sound: data.sound || 'siren',
       message: String(data.message || 'Waktunya bangun!').slice(0, 200),
@@ -773,9 +778,12 @@ io.on('connection', (socket) => {
       createdAt: Date.now()
     };
 
-    rooms[roomId].scheduledAlarms.push(newAlarm);
+    rooms[roomId].scheduledAlarms = [
+      ...rooms[roomId].scheduledAlarms.filter(a => a.id !== customId),
+      newAlarm
+    ];
     rooms[roomId].lastActivityAt = Date.now();
-    console.log(`[JADWAL DIBUAT] Room ${roomId} oleh ${newAlarm.creator} untuk jam ${newAlarm.timeString}`);
+    console.log(`[JADWAL DIBUAT] Room ${roomId} oleh ${newAlarm.creator} untuk jam ${newAlarm.timeString} (in ${Math.round((resolvedTriggerTime - Date.now()) / 1000)}s)`);
 
     io.to(roomId).emit('scheduled_list_updated', publicAlarms(rooms[roomId].scheduledAlarms));
     saveRooms(true);
@@ -805,7 +813,9 @@ io.on('connection', (socket) => {
   socket.on('stop_alarm', (data = {}) => {
     // Keamanan AUD-01: Wajib menggunakan roomId dari sesi socket yang terautentikasi
     const roomId = socket.data?.roomId;
-    if (!roomId || !rooms[roomId] || !rooms[roomId].isAlarmActive) return;
+    if (!roomId || !rooms[roomId]) return;
+    rooms[roomId].lastStoppedAt = Date.now();
+    if (!rooms[roomId].isAlarmActive) return;
 
     rooms[roomId].isAlarmActive = false;
     rooms[roomId].currentAlarm = null;
