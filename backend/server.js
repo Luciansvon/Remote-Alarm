@@ -2,7 +2,11 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { Server } = require('socket.io');
+const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
+
+// Tether E2EE Blind Relay storage
+const tetherPairs = new Map(); // pairId -> Set<ws>
 
 // Konfigurasi CORS (AUD-03): Membaca process.env.ALLOWED_ORIGINS jika didefinisikan
 const allowedOrigins = process.env.ALLOWED_ORIGINS
@@ -86,6 +90,17 @@ const server = http.createServer((req, res) => {
     sendJson(res, 200, {
       status: 'online',
       activeRooms: Object.keys(rooms).length,
+      timestamp: new Date().toISOString()
+    });
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/tether/status') {
+    sendJson(res, 200, {
+      status: 'online',
+      service: 'Tether E2EE Relay',
+      activePairs: tetherPairs.size,
+      totalConnected: Array.from(tetherPairs.values()).reduce((sum, s) => sum + s.size, 0),
       timestamp: new Date().toISOString()
     });
     return;
@@ -183,6 +198,85 @@ const io = new Server(server, {
     methods: ['GET', 'POST']
   },
   maxHttpBufferSize: 2e7 // 20 MB untuk transmisi rekaman suara
+});
+
+// --- TETHER E2EE BLIND RELAY (PATH: /tether) ---
+const tetherWss = new WebSocketServer({ noServer: true });
+
+tetherWss.on('connection', (ws, req) => {
+  const url = new URL(req.url, 'http://localhost');
+  const pairId = url.searchParams.get('pairId') || 'tether_default_pair';
+  const clientId = url.searchParams.get('clientId') || 'client_' + Date.now();
+
+  ws.pairId = pairId;
+  ws.clientId = clientId;
+  ws.isAlive = true;
+
+  if (!tetherPairs.has(pairId)) {
+    tetherPairs.set(pairId, new Set());
+  }
+  const clients = tetherPairs.get(pairId);
+  clients.add(ws);
+
+  console.log(`[TETHER RELAY] Client connected: ${clientId} to pair: ${pairId} (total: ${clients.size})`);
+
+  ws.send(JSON.stringify({
+    type: 'RELAY_CONNECTED',
+    pairId,
+    clientId,
+    peerCount: clients.size,
+    timestamp: Date.now()
+  }));
+
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
+  ws.on('message', (data, isBinary) => {
+    // Blind relay: Meneruskan ciphertext E2EE langsung ke pasangan tanpa didekripsi
+    for (const peer of clients) {
+      if (peer !== ws && peer.readyState === 1) { // 1 = WebSocket.OPEN
+        peer.send(data, { binary: isBinary });
+      }
+    }
+  });
+
+  ws.on('close', () => {
+    clients.delete(ws);
+    console.log(`[TETHER RELAY] Client disconnected: ${clientId} from pair: ${pairId} (remaining: ${clients.size})`);
+    if (clients.size === 0) {
+      tetherPairs.delete(pairId);
+    }
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[TETHER RELAY] Socket error for ${pairId}: ${err.message}`);
+  });
+});
+
+// Cloudflare 100s timeout prevention: 25s ping keepalive
+const tetherPingInterval = setInterval(() => {
+  for (const [, clients] of tetherPairs) {
+    for (const ws of clients) {
+      if (!ws.isAlive) {
+        ws.terminate();
+        clients.delete(ws);
+        continue;
+      }
+      ws.isAlive = false;
+      ws.ping();
+    }
+  }
+}, 25000);
+tetherPingInterval.unref();
+
+server.on('upgrade', (request, socket, head) => {
+  const { pathname } = new URL(request.url, 'http://localhost');
+  if (pathname === '/tether') {
+    tetherWss.handleUpgrade(request, socket, head, (ws) => {
+      tetherWss.emit('connection', ws, request);
+    });
+  }
 });
 
 // Menyimpan data ruangan pasangan, status alarm, dan jadwal alarm
