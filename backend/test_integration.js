@@ -189,6 +189,7 @@ async function main() {
   assert.strictEqual(stopRes.ok, true);
   const stopEvent = await httpStopB;
   assert.strictEqual(stopEvent.stopper, 'B_HTTP');
+  assert.ok(stopEvent.alarmId, 'alarm_stopped harus membawa alarmId agar jadwal tidak berbunyi ulang');
   assert.strictEqual(rooms[ROOM_ID].isAlarmActive, false);
 
   // Uji send_custom_text
@@ -228,6 +229,35 @@ async function main() {
   });
   const stateAfterDelRejoin = await rejoinAfterDel;
   assert.strictEqual(stateAfterDelRejoin.scheduledAlarms.some(s => s.id === clientSchId), false, 'Jadwal yang sudah dihapus tidak boleh hidup lagi saat rejoin');
+
+  // Sinkronisasi service native memakai tombstones agar jadwal yang dihapus tidak muncul lagi
+  const pollAfterDel = await fetch(`${URL}/api/poll?roomId=${ROOM_ID}&pin=${PIN}&deviceId=devB`).then(r => r.json());
+  assert.ok(Array.isArray(pollAfterDel.deletedScheduleIds), 'API poll harus mengirim deletedScheduleIds');
+  assert.ok(pollAfterDel.deletedScheduleIds.includes(clientSchId), 'ID jadwal yang dihapus harus ada di deletedScheduleIds');
+
+  // HP dengan jam lebih cepat bisa berhenti sebelum server memicu jadwal.
+  // alarmId harus membatalkan jadwal itu agar tidak berbunyi ulang.
+  const earlyId = 'sch_early_stop';
+  const earlyScheduled = once(b, 'scheduled_list_updated');
+  a2.emit('schedule_alarm', {
+    id: earlyId,
+    creator: 'A',
+    message: 'Jadwal dibatalkan',
+    triggerTime: Date.now() + 4000
+  });
+  const earlyList = await earlyScheduled;
+  assert.ok(earlyList.some(s => s.id === earlyId && s.fired === false), 'Jadwal dini harus terdaftar');
+
+  const cancelledList = once(b, 'scheduled_list_updated');
+  const earlyStopRes = await fetch(
+    `${URL}/api/stop?roomId=${ROOM_ID}&pin=${PIN}&stopper=A&alarmId=${earlyId}`,
+    { method: 'POST' }
+  ).then(r => r.json());
+  assert.strictEqual(earlyStopRes.ok, true);
+  const afterCancel = await cancelledList;
+  assert.strictEqual(afterCancel.find(s => s.id === earlyId).fired, true, 'Jadwal yang dihentikan dini harus ditandai fired');
+  await sleep(4500);
+  assert.strictEqual(rooms[ROOM_ID].isAlarmActive, false, 'Jadwal yang dihentikan dini tidak boleh berbunyi');
 
   // Rate limit PIN: 5 percobaan gagal, percobaan ke-6 diblokir
   for (let i = 1; i <= 5; i++) {

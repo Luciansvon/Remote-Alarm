@@ -145,6 +145,7 @@ const server = http.createServer((req, res) => {
       lastStoppedAt: room.lastStoppedAt || 0,
       lastCustomText: room.lastCustomText || null,
       scheduledAlarms: publicAlarms(room.scheduledAlarms),
+      deletedScheduleIds: (room.deletedScheduleIds || []).slice(-50),
       customAudios: room.customAudios || []
     });
     return;
@@ -159,7 +160,9 @@ const server = http.createServer((req, res) => {
       sendJson(res, 403, { ok: false, error: 'PIN salah' });
       return;
     }
-    const voiceDataUrl = getAudioFromDisk(audioId);
+    const voiceDataUrl = (room.customAudios || []).some(a => a.audioId === audioId)
+      ? getAudioFromDisk(audioId)
+      : null;
     if (!voiceDataUrl) {
       sendJson(res, 404, { ok: false });
       return;
@@ -172,17 +175,28 @@ const server = http.createServer((req, res) => {
     const roomId = String(url.searchParams.get('roomId') || '').trim().toUpperCase().slice(0, MAX_ROOM_ID_LENGTH);
     const pin = String(url.searchParams.get('pin') ?? '').trim();
     const stopper = String(url.searchParams.get('stopper') || 'Pasangan').trim().slice(0, 50) || 'Pasangan';
+    const requestedAlarmId = String(url.searchParams.get('alarmId') || '').trim().slice(0, 64);
     const room = rooms[roomId];
     if (!roomId || !pin || !room || room.pinHash !== hashPin(pin)) {
       sendJson(res, 403, { ok: false, error: 'PIN salah' });
       return;
     }
     room.lastStoppedAt = Date.now();
+    if (markScheduleStopped(room, requestedAlarmId)) {
+      room.lastActivityAt = Date.now();
+      io.to(roomId).emit('scheduled_list_updated', publicAlarms(room.scheduledAlarms));
+      saveRooms(true);
+    }
     if (room.isAlarmActive) {
+      const stoppedAlarmId = room.currentAlarm ? room.currentAlarm.id : null;
       room.isAlarmActive = false;
       room.currentAlarm = null;
       room.lastActivityAt = Date.now();
-      io.to(roomId).emit('alarm_stopped', { stopper, timestamp: room.lastStoppedAt });
+      io.to(roomId).emit('alarm_stopped', {
+        stopper,
+        timestamp: room.lastStoppedAt,
+        alarmId: stoppedAlarmId || requestedAlarmId || null
+      });
       saveRooms(true);
     }
     sendJson(res, 200, { ok: true });
@@ -497,6 +511,17 @@ function buildRoomState(roomId) {
   };
 }
 
+// Tandai jadwal yang sudah dihentikan sebelum server sempat memicunya,
+// supaya jam HP yang bergeser tidak membuat alarm berbunyi ulang.
+function markScheduleStopped(room, alarmId) {
+  if (!room || !alarmId) return false;
+  const schedule = (room.scheduledAlarms || []).find(a => a.id === alarmId);
+  if (!schedule || schedule.fired) return false;
+  schedule.fired = true;
+  schedule.firedAt = Date.now();
+  return true;
+}
+
 // Cek otomatis setiap 1 detik untuk alarm yang dijadwalkan & pemeliharaan memori (AUD-02)
 const maintenanceInterval = setInterval(() => {
   const now = Date.now();
@@ -548,10 +573,12 @@ const maintenanceInterval = setInterval(() => {
     if (room.isAlarmActive) {
       const alarmAt = (room.currentAlarm && (room.currentAlarm.timestamp || room.currentAlarm.firedAt)) || 0;
       if (now - alarmAt > ALARM_ACTIVE_TTL_MS) {
+        const stoppedAlarmId = room.currentAlarm ? room.currentAlarm.id : null;
         room.isAlarmActive = false;
         room.currentAlarm = null;
+        room.lastStoppedAt = now;
         console.log(`[ALARM TIMEOUT] Alarm Room ${roomId} dihentikan server karena aktif > 1 jam.`);
-        io.to(roomId).emit('alarm_stopped', { stopper: 'Server (timeout)', timestamp: now });
+        io.to(roomId).emit('alarm_stopped', { stopper: 'Server (timeout)', timestamp: now, alarmId: stoppedAlarmId });
         saveRooms();
       }
     }
@@ -744,6 +771,7 @@ io.on('connection', (socket) => {
   socket.on('get_audio', (data = {}) => {
     const roomId = socket.data?.roomId;
     if (!roomId || !rooms[roomId]) return;
+    if (!(rooms[roomId].customAudios || []).some(a => a.audioId === data.audioId)) return;
     const voiceDataUrl = getAudioFromDisk(data.audioId);
     if (!voiceDataUrl) return;
     if (!socket.data.cachedAudioIds) socket.data.cachedAudioIds = new Set();
@@ -908,12 +936,22 @@ io.on('connection', (socket) => {
     // Keamanan AUD-01: Wajib menggunakan roomId dari sesi socket yang terautentikasi
     const roomId = socket.data?.roomId;
     if (!roomId || !rooms[roomId]) return;
-    rooms[roomId].lastStoppedAt = Date.now();
-    if (!rooms[roomId].isAlarmActive) return;
+    const room = rooms[roomId];
+    const requestedAlarmId = String(data.alarmId || '').trim().slice(0, 64);
+    room.lastStoppedAt = Date.now();
 
-    rooms[roomId].isAlarmActive = false;
-    rooms[roomId].currentAlarm = null;
-    rooms[roomId].lastActivityAt = Date.now();
+    // HP bisa berbunyi lebih dulu dari server (jam perangkat bergeser).
+    // Simpan pembatalan berdasarkan alarmId agar jadwal itu tidak dipicu lagi.
+    if (markScheduleStopped(room, requestedAlarmId)) {
+      io.to(roomId).emit('scheduled_list_updated', publicAlarms(room.scheduledAlarms));
+      saveRooms(true);
+    }
+    if (!room.isAlarmActive) return;
+
+    const stoppedAlarmId = room.currentAlarm ? room.currentAlarm.id : null;
+    room.isAlarmActive = false;
+    room.currentAlarm = null;
+    room.lastActivityAt = Date.now();
 
     const stopperName = data.stopper || socket.data?.username || 'Pacar';
     console.log(`[ALARM DIMATIKAN] Room ${roomId} oleh ${stopperName} (${socket.id})`);
@@ -921,7 +959,8 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('alarm_stopped', {
       stopper: stopperName,
       stopperSocketId: socket.id,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      alarmId: stoppedAlarmId || requestedAlarmId || null
     });
     saveRooms(true);
   });

@@ -43,6 +43,8 @@ public class WakeMateNativePlugin extends Plugin {
             try {
                 JSObject payload = new JSObject();
                 payload.put("stopped", true);
+                String alarmId = WakeMateKeeperService.getLastStoppedAlarmKey();
+                if (alarmId != null) payload.put("alarmId", alarmId);
                 inst.notifyListeners("nativeAlarmStopped", payload);
             } catch (Exception ignored) {
             }

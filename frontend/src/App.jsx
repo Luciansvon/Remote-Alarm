@@ -144,6 +144,8 @@ export default function App() {
   const [missionCount, setMissionCount] = useState(0);
   const isAlarmActiveRef = useRef(false);
   const alarmDataRef = useRef(null);
+  // ID alarm yang sudah dimatikan; mencegah jadwal yang sama berbunyi ulang
+  const stoppedAlarmIdsRef = useRef(new Set());
 
   const socketRef = useRef(null);
 
@@ -163,11 +165,15 @@ export default function App() {
     document.addEventListener('visibilitychange', onVis);
     let subPromise = null;
     if (Capacitor.isNativePlatform() && typeof WakeMateNative.addListener === 'function') {
-      subPromise = WakeMateNative.addListener('nativeAlarmStopped', () => {
+      subPromise = WakeMateNative.addListener('nativeAlarmStopped', (payload) => {
+        if (payload?.alarmId) {
+          stoppedAlarmIdsRef.current.add(payload.alarmId);
+          setScheduledAlarms(prev => prev.map(a => (a.id === payload.alarmId ? { ...a, fired: true } : a)));
+        }
         const stopper = currentRole === 'bima' ? 'Bima' : 'Pacar';
         stopLocalAlarm(stopper);
         if (socketRef.current) {
-          socketRef.current.emit('stop_alarm', { roomId, stopper });
+          socketRef.current.emit('stop_alarm', { roomId, stopper, alarmId: payload?.alarmId || undefined });
         }
       }).catch(() => null);
     }
@@ -381,6 +387,10 @@ export default function App() {
 
     socket.on('alarm_stopped', (data) => {
       const stopper = data?.stopper || 'Pasangan';
+      if (data?.alarmId) {
+        stoppedAlarmIdsRef.current.add(data.alarmId);
+        setScheduledAlarms(prev => prev.map(a => (a.id === data.alarmId ? { ...a, fired: true } : a)));
+      }
       if (isAlarmActiveRef.current) {
         stopLocalAlarm(stopper);
       } else {
@@ -446,6 +456,11 @@ export default function App() {
       previewAudioEl.currentTime = 0;
     }
     setIsPlayingPreview(false);
+  };
+
+  const showOfflineNotice = () => {
+    setWakeUpNotice('📴 Server sedang offline. Cek koneksi internet dulu ya.');
+    setTimeout(() => setWakeUpNotice(null), 4000);
   };
 
   const playPreviewAudio = (audioUrl) => {
@@ -538,6 +553,7 @@ export default function App() {
 
   // Memicu Alarm Aktif di Layar
   const triggerLocalAlarm = async (data) => {
+    if (data?.id && stoppedAlarmIdsRef.current.has(data.id)) return;
     if (isAlarmActiveRef.current && data?.id && alarmDataRef.current?.id === data.id) {
       return;
     }
@@ -598,6 +614,11 @@ export default function App() {
   // Menghentikan Alarm
   const stopLocalAlarm = (stopper) => {
     const wasActive = isAlarmActiveRef.current;
+    const stoppedAlarmId = alarmDataRef.current?.id;
+    if (stoppedAlarmId) {
+      stoppedAlarmIdsRef.current.add(stoppedAlarmId);
+      setScheduledAlarms(prev => prev.map(a => (a.id === stoppedAlarmId ? { ...a, fired: true } : a)));
+    }
     isAlarmActiveRef.current = false;
     alarmDataRef.current = null;
     setIsAlarmActive(false);
@@ -691,7 +712,10 @@ export default function App() {
 
   // Kirim Alarm Instan
   const handleSendInstantAlarm = () => {
-    if (!socketRef.current) return;
+    if (!socketRef.current?.connected) {
+      showOfflineNotice();
+      return;
+    }
     const creatorName = currentRole === 'bima' ? 'Bima' : 'Pacar';
     const targetName = currentRole === 'bima' ? 'Pacar' : 'Bima';
     const isCustom = selectedSound === 'tiktok' || selectedSound === 'voice';
@@ -799,7 +823,11 @@ export default function App() {
 
   const handleSendCustomText = () => {
     const text = customMessage.trim();
-    if (!text || !socketRef.current) return;
+    if (!text) return;
+    if (!socketRef.current?.connected) {
+      showOfflineNotice();
+      return;
+    }
     const creatorName = currentRole === 'bima' ? 'Bima' : 'Pacar';
     socketRef.current.emit('send_custom_text', {
       roomId,
@@ -818,12 +846,13 @@ export default function App() {
     }
 
     const stopper = currentRole === 'bima' ? 'Bima' : 'Pacar';
+    const stoppedAlarmId = alarmDataRef.current?.id || alarmData?.id;
 
     // Matikan suara lokal terlebih dahulu (optimistic local stop) agar aman jika koneksi offline
     stopLocalAlarm(stopper);
 
     if (socketRef.current) {
-      socketRef.current.emit('stop_alarm', { roomId, stopper });
+      socketRef.current.emit('stop_alarm', { roomId, stopper, alarmId: stoppedAlarmId || undefined });
     }
   };
 

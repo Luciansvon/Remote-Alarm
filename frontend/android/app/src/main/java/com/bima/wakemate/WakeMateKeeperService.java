@@ -31,8 +31,10 @@ import java.net.URLEncoder;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -63,6 +65,12 @@ public class WakeMateKeeperService extends Service {
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private ScheduledExecutorService scheduler;
+    private final Set<String> audioDownloadsInProgress = Collections.synchronizedSet(new HashSet<>());
+    private ExecutorService audioExecutor;
+
+    public static String getLastStoppedAlarmKey() {
+        return lastStoppedAlarmKey;
+    }
 
     public static synchronized void stopNativeMediaOnly() {
         if (mediaPlayer != null) {
@@ -99,6 +107,7 @@ public class WakeMateKeeperService extends Service {
             lastStoppedAlarmKey = activeAlarmKey;
             activeAlarmKey = null;
         }
+        final String stoppedAlarmId = lastStoppedAlarmKey;
         if (ctx != null) {
             NotificationManager manager = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
             if (manager != null) {
@@ -113,12 +122,16 @@ public class WakeMateKeeperService extends Service {
                     String roomId = prefs.getString("roomId", "");
                     String roomPin = prefs.getString("roomPin", "");
                     String role = prefs.getString("role", "Pasangan");
+                    if (stoppedAlarmId != null) {
+                        prefs.edit().putString("lastStoppedAlarmKey", stoppedAlarmId).apply();
+                    }
                     if (serverUrl.isEmpty() || roomId.isEmpty() || roomPin.isEmpty()) return;
 
                     String stopperName = "bima".equalsIgnoreCase(role) ? "Bima" : ("pacar".equalsIgnoreCase(role) ? "Pacar" : role);
                     String urlStr = serverUrl + "/api/stop?roomId=" + URLEncoder.encode(roomId, "UTF-8")
                             + "&pin=" + URLEncoder.encode(roomPin, "UTF-8")
-                            + "&stopper=" + URLEncoder.encode(stopperName.isEmpty() ? "Pasangan" : stopperName, "UTF-8");
+                            + "&stopper=" + URLEncoder.encode(stopperName.isEmpty() ? "Pasangan" : stopperName, "UTF-8")
+                            + "&alarmId=" + URLEncoder.encode(stoppedAlarmId == null ? "" : stoppedAlarmId, "UTF-8");
                     HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
                     conn.setRequestMethod("POST");
                     conn.setConnectTimeout(4000);
@@ -183,7 +196,6 @@ public class WakeMateKeeperService extends Service {
                     .setCategory(NotificationCompat.CATEGORY_ALARM)
                     .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                     .setDefaults(NotificationCompat.DEFAULT_VIBRATE | NotificationCompat.DEFAULT_LIGHTS)
-                    .setFullScreenIntent(pendingIntent, true)
                     .setContentIntent(pendingIntent)
                     .setOngoing(true)
                     .setAutoCancel(false)
@@ -277,6 +289,14 @@ public class WakeMateKeeperService extends Service {
     public void onCreate() {
         super.onCreate();
         createNotificationChannels();
+        // Bertahan setelah proses dibunuh: jangan bunyikan ulang alarm yang sudah dihentikan.
+        if (lastStoppedAlarmKey == null) {
+            lastStoppedAlarmKey = getSharedPreferences(WakeMateNativePlugin.PREFS_NAME, Context.MODE_PRIVATE)
+                    .getString("lastStoppedAlarmKey", null);
+        }
+        if (audioExecutor == null) {
+            audioExecutor = Executors.newSingleThreadExecutor();
+        }
 
         Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("WakeMate Siaga")
@@ -379,16 +399,44 @@ public class WakeMateKeeperService extends Service {
             // 1. Sinkronisasi jadwal alarm dari server (pertahankan status fired lokal)
             if (resp.has("scheduledAlarms")) {
                 JSONArray serverSchedules = resp.optJSONArray("scheduledAlarms");
-                if (serverSchedules != null) {
-                    Set<String> firedIds = getLocallyFiredIds(prefs.getString("schedulesJson", "[]"));
-                    for (int i = 0; i < serverSchedules.length(); i++) {
-                        JSONObject item = serverSchedules.optJSONObject(i);
-                        if (item != null && firedIds.contains(item.optString("id", ""))) {
-                            item.put("fired", true);
-                        }
+                if (serverSchedules == null) serverSchedules = new JSONArray();
+                JSONArray localSchedules = new JSONArray(prefs.getString("schedulesJson", "[]"));
+                Set<String> firedIds = new HashSet<>();
+                Set<String> serverIds = new HashSet<>();
+                Set<String> deletedIds = new HashSet<>();
+
+                for (int i = 0; i < localSchedules.length(); i++) {
+                    JSONObject local = localSchedules.optJSONObject(i);
+                    if (local != null && local.optBoolean("fired", false)) {
+                        String id = local.optString("id", "");
+                        if (!id.isEmpty()) firedIds.add(id);
                     }
-                    prefs.edit().putString("schedulesJson", serverSchedules.toString()).apply();
                 }
+                JSONArray deleted = resp.optJSONArray("deletedScheduleIds");
+                if (deleted != null) {
+                    for (int i = 0; i < deleted.length(); i++) {
+                        deletedIds.add(deleted.optString(i, ""));
+                    }
+                }
+                for (int i = 0; i < serverSchedules.length(); i++) {
+                    JSONObject item = serverSchedules.optJSONObject(i);
+                    if (item == null) continue;
+                    String id = item.optString("id", "");
+                    if (!id.isEmpty()) serverIds.add(id);
+                    if (firedIds.contains(id)) item.put("fired", true);
+                }
+                // Jadwal yang dibuat saat offline belum ada di server: jangan dibuang.
+                long now = System.currentTimeMillis();
+                for (int i = 0; i < localSchedules.length(); i++) {
+                    JSONObject local = localSchedules.optJSONObject(i);
+                    if (local == null) continue;
+                    String id = local.optString("id", "");
+                    if (id.isEmpty() || serverIds.contains(id) || deletedIds.contains(id)) continue;
+                    if (local.optBoolean("fired", false)) continue;
+                    if (local.optLong("triggerTime", 0L) < now - 300_000L) continue;
+                    serverSchedules.put(local);
+                }
+                prefs.edit().putString("schedulesJson", serverSchedules.toString()).apply();
             }
 
             // 2. Unduh audio kustom yang belum tersimpan di memori internal native
@@ -450,9 +498,13 @@ public class WakeMateKeeperService extends Service {
                 }
             } else if (!isAlarmActive && activeAlarmKey != null) {
                 long elapsed = System.currentTimeMillis() - activeAlarmStartedAt;
-                if (lastStoppedAt >= activeAlarmStartedAt || elapsed > 15_000L) {
-                    stopNativeMediaOnly();
+                // 10 menit, bukan 15 detik: jam HP yang lebih cepat bisa memicu jadwal lokal
+                // sebelum server sempat menandai alarm aktif.
+                if (lastStoppedAt >= activeAlarmStartedAt || elapsed > 600_000L) {
+                    lastStoppedAlarmKey = activeAlarmKey;
                     activeAlarmKey = null;
+                    prefs.edit().putString("lastStoppedAlarmKey", lastStoppedAlarmKey).apply();
+                    stopNativeMediaOnly();
                     NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
                     if (manager != null) {
                         manager.cancel(ALARM_NOTIFICATION_ID);
@@ -467,54 +519,47 @@ public class WakeMateKeeperService extends Service {
         }
     }
 
-    private Set<String> getLocallyFiredIds(String schedulesJson) {
-        Set<String> set = new HashSet<>();
-        try {
-            JSONArray arr = new JSONArray(schedulesJson);
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject item = arr.optJSONObject(i);
-                if (item != null && item.optBoolean("fired", false)) {
-                    String id = item.optString("id", "");
-                    if (!id.isEmpty()) set.add(id);
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        return set;
-    }
-
-    private void ensureCustomAudioCached(String serverUrl, String roomId, String roomPin, String audioId) {
-        String safeId = audioId.replaceAll("[^a-zA-Z0-9._-]", "_");
-        File outFile = new File(getFilesDir(), "audio_" + safeId + ".mp3");
+    private void ensureCustomAudioCached(final String serverUrl, final String roomId, final String roomPin, final String audioId) {
+        final String safeId = audioId.replaceAll("[^a-zA-Z0-9._-]", "_");
+        final File outFile = new File(getFilesDir(), "audio_" + safeId + ".mp3");
         if (outFile.exists() && outFile.length() > 0) return;
-
-        HttpURLConnection conn = null;
-        try {
-            String urlStr = serverUrl + "/api/audio?roomId=" + URLEncoder.encode(roomId, "UTF-8")
-                    + "&pin=" + URLEncoder.encode(roomPin, "UTF-8")
-                    + "&audioId=" + URLEncoder.encode(audioId, "UTF-8");
-            conn = (HttpURLConnection) new URL(urlStr).openConnection();
-            conn.setRequestMethod("GET");
-            conn.setConnectTimeout(4000);
-            conn.setReadTimeout(4000);
-
-            if (conn.getResponseCode() != 200) return;
-            JSONObject obj = new JSONObject(readStream(conn.getInputStream()));
-            String dataUrl = obj.optString("voiceDataUrl", obj.optString("dataUrl", ""));
-            if (dataUrl.isEmpty()) return;
-
-            int commaIdx = dataUrl.indexOf(',');
-            String b64 = commaIdx >= 0 ? dataUrl.substring(commaIdx + 1) : dataUrl;
-            byte[] bytes = Base64.decode(b64, Base64.DEFAULT);
-            try (FileOutputStream fos = new FileOutputStream(outFile)) {
-                fos.write(bytes);
-            }
-        } catch (Exception ignored) {
-        } finally {
-            if (conn != null) {
-                conn.disconnect();
-            }
+        if (!audioDownloadsInProgress.add(audioId)) return;
+        if (audioExecutor == null) {
+            audioDownloadsInProgress.remove(audioId);
+            return;
         }
+
+        // Unduh di thread terpisah: file audio besar tidak boleh memblokir cek jadwal alarm.
+        audioExecutor.execute(() -> {
+            HttpURLConnection conn = null;
+            try {
+                String urlStr = serverUrl + "/api/audio?roomId=" + URLEncoder.encode(roomId, "UTF-8")
+                        + "&pin=" + URLEncoder.encode(roomPin, "UTF-8")
+                        + "&audioId=" + URLEncoder.encode(audioId, "UTF-8");
+                conn = (HttpURLConnection) new URL(urlStr).openConnection();
+                conn.setRequestMethod("GET");
+                conn.setConnectTimeout(8000);
+                conn.setReadTimeout(30000);
+
+                if (conn.getResponseCode() != 200) return;
+                JSONObject obj = new JSONObject(readStream(conn.getInputStream()));
+                String dataUrl = obj.optString("voiceDataUrl", obj.optString("dataUrl", ""));
+                if (dataUrl.isEmpty()) return;
+
+                int commaIdx = dataUrl.indexOf(',');
+                String b64 = commaIdx >= 0 ? dataUrl.substring(commaIdx + 1) : dataUrl;
+                byte[] bytes = Base64.decode(b64, Base64.DEFAULT);
+                try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                    fos.write(bytes);
+                }
+            } catch (Exception ignored) {
+            } finally {
+                if (conn != null) {
+                    conn.disconnect();
+                }
+                audioDownloadsInProgress.remove(audioId);
+            }
+        });
     }
 
     private void showCustomTextNotification(String sender, String message) {
@@ -566,20 +611,26 @@ public class WakeMateKeeperService extends Service {
         // 2. Tampilkan notifikasi pop-up di depan layar dengan tombol "Aku Udah Bangun Sayang"
         postAlarmPopupNotification(this, "🚨 Alarm dari " + sender, message);
 
-        // 3. Jika Activity sedang tertutup/di-swipe, bunyikan MediaPlayer native + Vibrator
+        // 3. Jika Activity sedang tertutup/di-swipe, nyalakan layar agar notifikasi
+        //    dengan tombol "Aku Udah Bangun Sayang" langsung terlihat, lalu bunyikan
+        //    MediaPlayer native + Vibrator tanpa membuka aplikasi.
         if (!MainActivity.isActivityVisible) {
-            try {
-                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-                if (pm != null && !pm.isInteractive()) {
-                    Intent activityIntent = new Intent(this, MainActivity.class);
-                    activityIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
-                            | Intent.FLAG_ACTIVITY_CLEAR_TOP
-                            | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-                    startActivity(activityIntent);
-                }
-            } catch (Exception ignored) {
-            }
+            wakeScreenForAlarm();
             startNativeMedia(this, sound, audioId);
+        }
+    }
+
+    private void wakeScreenForAlarm() {
+        try {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            if (pm == null || pm.isInteractive()) return;
+            PowerManager.WakeLock screenLock = pm.newWakeLock(
+                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                            | PowerManager.ACQUIRE_CAUSES_WAKEUP
+                            | PowerManager.ON_AFTER_RELEASE,
+                    "WakeMate::AlarmScreen");
+            screenLock.acquire(15000L);
+        } catch (Exception ignored) {
         }
     }
 
@@ -738,6 +789,10 @@ public class WakeMateKeeperService extends Service {
         if (scheduler != null) {
             scheduler.shutdownNow();
             scheduler = null;
+        }
+        if (audioExecutor != null) {
+            audioExecutor.shutdownNow();
+            audioExecutor = null;
         }
         if (wakeLock != null && wakeLock.isHeld()) {
             try {
